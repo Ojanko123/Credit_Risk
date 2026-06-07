@@ -262,7 +262,7 @@ python credit_risk.py
 - Hyperparameter tuning via `RandomizedSearchCV`
 - Model evaluation: AUC, Gini, KS statistic, Brier score
 - Calibration analysis: Hosmer-Lemeshow test and decile calibration
-- Credit scorecard scaling (PDO method, 300–850 scale)
+- Credit scorecard scaling (PDO method, 300-850 scale)
 - Population Stability Index (PSI) for model monitoring
 - SHAP explainability for tree-based models
 - IFRS 9 ECL framework: PD × LGD × EAD
