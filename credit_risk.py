@@ -335,7 +335,7 @@ y_test_woe  = test_woe['target']
 # PHASE 7: LOGISTIC REGRESSION (WoE FEATURES)
 
 print("\n" + "=" * 65)
-print("PHASE 7 — LOGISTIC REGRESSION (WoE Features)")
+print("PHASE 7 - LOGISTIC REGRESSION (WoE Features)")
 print("=" * 65)
 
 lr = LogisticRegression(max_iter=1000, random_state=42,
@@ -928,7 +928,288 @@ if SHAP_OK:
     plt.savefig('chart_09_shap.png', dpi=150, bbox_inches='tight')
     plt.show()
     print("Saved: chart_09_shap.png")
-
-print("\n" + "=" * 65)
-print("All charts saved individually.")
 print("=" * 65)
+# PHASE 15: IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK
+# Three macroeconomic scenarios are applied with probability weights:
+# • Base (50%) - stable economic conditions
+# • Optimistic(30%) - benign credit environment
+# • Downturn (20%) - stressed / recessionary conditions
+# PD is taken directly from the calibrated XGBoost model.
+# LGD and EAD assumptions are fixed at loan-level using industry
+# conventions and are held constant across scenarios.
+# Scenario stress is applied via PD scalar multipliers.
+
+ 
+print("\n" + "=" * 65)
+print("PHASE 15 - IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK")
+print("=" * 65)
+ 
+#  Rebuild test set with loan amounts 
+# We need the original loan_amnt column from test_raw.
+# test_raw was defined as loans_raw.iloc[split:].copy()
+# xgb_probs are the model PDs for the test set (same rows).
+ 
+print("\nStep 1: Attaching loan-level data to test set PDs")
+ 
+ecl_df = pd.DataFrame({
+'pd_model' : xgb_probs, # model PD 
+'loan_amnt' : test_raw['loan_amnt'].values,
+'actual' : y_test_ohe # true label
+}).reset_index(drop=True)
+ 
+print(f" ECL working dataset: {ecl_df.shape[0]:,} loans")
+print(f" Mean model PD: {ecl_df['pd_model'].mean():.2%}")
+ 
+#LGD Assumption 
+# Loss Given Default: the fraction of EAD lost if the borrower defaults.
+# LendingClub is unsecured consumer lending - industry LGD for
+# unsecured retail is typically 65-75%.
+# I use a tiered LGD based on loan amount (larger loans = slightly higher loss rate due to lower recovery on larger unsecured balances).
+print("\nStep 2: Assigning LGD (tiered by loan amount)")
+ 
+def assign_lgd(loan_amnt):
+    if loan_amnt <= 5000:
+     return 0.60
+    elif loan_amnt <= 15000:
+     return 0.65
+    elif loan_amnt <= 25000:
+     return 0.70
+    else:
+     return 0.75
+ 
+ecl_df['lgd'] = ecl_df['loan_amnt'].apply(assign_lgd)
+print(f" LGD distribution:")
+print(ecl_df['lgd'].value_counts().sort_index().to_string())
+ 
+# EAD Assumption 
+# Exposure at Default: the outstanding balance at the time of default.
+# For term loans (LendingClub) EAD ≈ loan_amnt at origination
+# (no revolving draw-down risk). We apply a small amortisation
+# factor to reflect partial principal repayment before default,
+# assuming on average ~10% has been paid down.
+print("\nStep 3: Assigning EAD (loan amount with amortisation factor")
+ 
+AMORTISATION_FACTOR = 0.90 # assume 10% average principal repaid
+ecl_df['ead'] = ecl_df['loan_amnt'] * AMORTISATION_FACTOR
+ 
+print(f" Amortisation factor applied: {AMORTISATION_FACTOR:.0%}")
+print(f" Mean EAD: £{ecl_df['ead'].mean():,.0f}")
+print(f" Total portfolio EAD: £{ecl_df['ead'].sum():,.0f}")
+ 
+# Scenario PD Multipliers 
+# IFRS 9 requires probability-weighted forward-looking scenarios.
+# PD multipliers represent how the macroeconomic environment
+# shifts default rates relative to the model's through-the-cycle PD.
+print("\nStep 4: Defining macro scenarios")
+ 
+scenarios = {
+'Optimistic' : {'weight': 0.30, 'pd_multiplier': 0.75},
+'Base' : {'weight': 0.50, 'pd_multiplier': 1.00},
+'Downturn' : {'weight': 0.20, 'pd_multiplier': 1.50},
+}
+ 
+print(f"\n {'Scenario':<12} {'Weight':>8} {'PD Scalar':>10} {'Implied Avg PD':>15}")
+print(" " + "-" * 48)
+for name, cfg in scenarios.items():
+   implied_pd = ecl_df['pd_model'].mean() * cfg['pd_multiplier']
+print(f" {name:<12} {cfg['weight']:>8.0%} {cfg['pd_multiplier']:>10.2f}x"
+f" {implied_pd:>15.2%}")
+ 
+# ECL Calculation per Scenario
+print("\nStep 5: Computing ECL per scenario")
+
+ecl_results = {}
+
+# Compute each scenario explicitly - no dynamic naming
+pd_optimistic = np.clip(ecl_df['pd_model'] * 0.75, 0, 1)
+pd_base       = np.clip(ecl_df['pd_model'] * 1.00, 0, 1)
+pd_downturn   = np.clip(ecl_df['pd_model'] * 1.50, 0, 1)
+
+ecl_df['pd_optimistic']  = pd_optimistic
+ecl_df['pd_base']        = pd_base
+ecl_df['pd_downturn']    = pd_downturn
+
+ecl_df['ecl_optimistic'] = ecl_df['pd_optimistic'] * ecl_df['lgd'] * ecl_df['ead']
+ecl_df['ecl_base']       = ecl_df['pd_base']       * ecl_df['lgd'] * ecl_df['ead']
+ecl_df['ecl_downturn']   = ecl_df['pd_downturn']   * ecl_df['lgd'] * ecl_df['ead']
+
+# Verify columns exist before proceeding
+for col in ['ecl_optimistic', 'ecl_base', 'ecl_downturn']:
+    assert col in ecl_df.columns, f"Missing column: {col}"
+
+total_ead = ecl_df['ead'].sum()
+
+ecl_results['Optimistic'] = {
+    'total_ecl' : ecl_df['ecl_optimistic'].sum(),
+    'ecl_rate'  : ecl_df['ecl_optimistic'].sum() / total_ead,
+    'weight'    : 0.30
+}
+ecl_results['Base'] = {
+    'total_ecl' : ecl_df['ecl_base'].sum(),
+    'ecl_rate'  : ecl_df['ecl_base'].sum() / total_ead,
+    'weight'    : 0.50
+}
+ecl_results['Downturn'] = {
+    'total_ecl' : ecl_df['ecl_downturn'].sum(),
+    'ecl_rate'  : ecl_df['ecl_downturn'].sum() / total_ead,
+    'weight'    : 0.20
+}
+
+for name, res in ecl_results.items():
+    print(f"\n  [{name}]")
+    print(f"    Total ECL:          £{res['total_ecl']:>15,.0f}")
+    print(f"    ECL Rate (ECL/EAD): {res['ecl_rate']:>10.2%}")
+
+# Probability-Weighted ECL (IFRS 9 headline number)
+print("\nStep 6: Probability-weighted ECL (IFRS 9 headline)")
+
+ecl_df['ecl_weighted'] = (
+    ecl_df['ecl_optimistic'] * 0.30 +
+    ecl_df['ecl_base']       * 0.50 +
+    ecl_df['ecl_downturn']   * 0.20
+)
+
+total_weighted_ecl = ecl_df['ecl_weighted'].sum()
+weighted_ecl_rate  = total_weighted_ecl / total_ead
+
+print(f"\n  Probability-Weighted ECL:  £{total_weighted_ecl:>15,.0f}")
+print(f"  Weighted ECL Rate:          {weighted_ecl_rate:>10.2%}")
+print(f"  Total Portfolio EAD:       £{total_ead:>15,.0f}")
+# ECL Summary Table
+print("IFRS 9 ECL SUMMARY")
+print(f" {'Scenario':<14} {'Weight':>7} {'Total ECL':>16} {'ECL Rate':>10}")
+print(" " + "-" * 50)
+for name, res in ecl_results.items():
+   print(f" {name:<14} {res['weight']:>7.0%}"
+f" £{res['total_ecl']:>15,.0f} {res['ecl_rate']:>9.2%}")
+print(" " + "-" * 50)
+print(f" {'Weighted (IFRS9)':<14} {'100%':>7}"
+f" £{total_weighted_ecl:>15,.0f} {weighted_ecl_rate:>9.2%}")
+ 
+# ECL by Grade Bucket 
+# Segment ECL by loan grade to show where credit risk is concentrated.
+if 'grade' in test_raw.columns:
+   print("\nStep 7: ECL breakdown by loan grade...")
+ecl_df['grade'] = test_raw['grade'].values
+ 
+grade_summary = ecl_df.groupby('grade').agg(
+loans = ('ead', 'count'),
+total_ead = ('ead', 'sum'),
+mean_pd = ('pd_model', 'mean'),
+mean_lgd = ('lgd', 'mean'),
+total_ecl_w = ('ecl_weighted', 'sum')
+).reset_index()
+ 
+grade_summary['ecl_rate'] = (grade_summary['total_ecl_w'] /
+grade_summary['total_ead'])
+grade_summary['ecl_share'] = (grade_summary['total_ecl_w'] /
+grade_summary['total_ecl_w'].sum())
+ 
+print(f"\n {'Grade':<8} {'Loans':>8} {'Avg PD':>8} {'Avg LGD':>8}"
+f" {'ECL':>14} {'ECL Rate':>9} {'ECL Share':>10}")
+print(" " + "-" * 70)
+for _, row in grade_summary.iterrows():
+   print(f" {row['grade']:<8} {int(row['loans']):>8,}"
+f" {row['mean_pd']:>8.2%} {row['mean_lgd']:>8.2%}"
+f" £{row['total_ecl_w']:>13,.0f} {row['ecl_rate']:>9.2%}"
+f" {row['ecl_share']:>10.2%}")
+ 
+# Visualisations 
+print("\nGenerating IFRS 9 visualisations")
+ 
+fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+fig.suptitle('IFRS 9 Expected Credit Loss Framework\n'
+'ECL = PD × LGD × EAD | Three Scenario Analysis',
+fontsize=13, fontweight='bold', y=1.01)
+ 
+# Plot A: ECL by Scenario (bar) 
+ax = axes[0, 0]
+scenario_names = list(ecl_results.keys()) + ['Weighted\n(IFRS 9)']
+scenario_values = [ecl_results[s]['total_ecl'] / 1e6
+for s in ecl_results] + [total_weighted_ecl / 1e6]
+bar_colors = ['#2ecc71', '#3498db', '#e74c3c', '#8e44ad']
+bars = ax.bar(scenario_names, scenario_values,
+color=bar_colors, edgecolor='black', alpha=0.85)
+ax.bar_label(bars, fmt='£%.1fM', fontsize=9, padding=3)
+ax.set_title('Total ECL by Scenario', fontsize=11, fontweight='bold')
+ax.set_ylabel('Expected Credit Loss (£M)', fontsize=10)
+ax.yaxis.set_major_formatter(
+plt.FuncFormatter(lambda x, _: f'£{x:.1f}M'))
+ax.grid(True, alpha=0.3, axis='y')
+ 
+# Plot B: ECL Rate by Scenario 
+ax = axes[0, 1]
+scenario_rates = [ecl_results[s]['ecl_rate'] * 100
+for s in ecl_results] + [weighted_ecl_rate * 100]
+bars2 = ax.bar(scenario_names, scenario_rates,
+color=bar_colors, edgecolor='black', alpha=0.85)
+ax.bar_label(bars2, fmt='%.2f%%', fontsize=9, padding=3)
+ax.set_title('ECL Rate by Scenario (ECL / EAD)', fontsize=11,
+fontweight='bold')
+ax.set_ylabel('ECL Rate (%)', fontsize=10)
+ax.grid(True, alpha=0.3, axis='y')
+ 
+# Plot C: ECL Distribution (weighted)
+ax = axes[1, 0]
+ax.hist(ecl_df['ecl_weighted'], bins=60,
+color='steelblue', edgecolor='black', alpha=0.75)
+ax.axvline(ecl_df['ecl_weighted'].mean(), color='red',
+linestyle='--', linewidth=1.5,
+label=f"Mean ECL = £{ecl_df['ecl_weighted'].mean():,.0f}")
+ax.axvline(ecl_df['ecl_weighted'].median(), color='orange',
+linestyle=':', linewidth=1.5,
+label=f"Median ECL = £{ecl_df['ecl_weighted'].median():,.0f}")
+ax.set_title('Loan-Level ECL Distribution\n(Probability-Weighted)',
+fontsize=11, fontweight='bold')
+ax.set_xlabel('ECL per Loan (£)', fontsize=10)
+ax.set_ylabel('Frequency', fontsize=10)
+ax.legend(fontsize=9)
+ax.grid(True, alpha=0.3)
+ 
+# Plot D: ECL Share by Grade
+ax = axes[1, 1]
+if 'grade' in ecl_df.columns:
+   grade_plot = grade_summary.sort_values('grade')
+   ax.bar(grade_plot['grade'],
+   grade_plot['ecl_share'] * 100,
+   color='steelblue', edgecolor='black', alpha=0.85)
+   ax2_twin = ax.twinx()
+   ax2_twin.plot(grade_plot['grade'],
+   grade_plot['mean_pd'] * 100,
+   'ro-', linewidth=2, markersize=6,
+   label='Avg PD (%)')
+   ax2_twin.set_ylabel('Average PD (%)', color='red', fontsize=10)
+   ax2_twin.tick_params(axis='y', labelcolor='red')
+   ax2_twin.legend(loc='upper left', fontsize=9)
+   ax.set_title('ECL Concentration & Avg PD by Grade',
+   fontsize=11, fontweight='bold')
+   ax.set_xlabel('Loan Grade', fontsize=10)
+   ax.set_ylabel('ECL Share (%)', fontsize=10)
+   ax.grid(True, alpha=0.3, axis='y')
+else: ax.axis('off')
+ax.text(0.5, 0.5, 'Grade data not available',
+ ha='center', va='center', transform=ax.transAxes)
+ 
+plt.tight_layout()
+plt.savefig('chart_10_ifrs9_ecl.png', dpi=150, bbox_inches='tight')
+plt.show()
+print("Saved: chart_10_ifrs9_ecl.png")
+ 
+# Final Summary 
+print("\n" + "=" * 65)
+print("IFRS 9 ECL FRAMEWORK - COMPLETE")
+print("=" * 65)
+print(f"\n Loans analysed: {len(ecl_df):>12,}")
+print(f" Total Portfolio EAD: £{total_ead:>12,.0f}")
+print(f" Avg LGD assumption: {ecl_df['lgd'].mean():>11.1%}")
+print(f" Amortisation factor: {AMORTISATION_FACTOR:>11.0%}")
+print(f"\n ECL by scenario:")
+for name, res in ecl_results.items():
+ print(f" {name:<12} (w={res['weight']:.0%}): "
+f"£{res['total_ecl']:>12,.0f} | {res['ecl_rate']:.2%} of EAD")
+print(f"\n IFRS 9 Weighted ECL: £{total_weighted_ecl:>12,.0f}")
+print(f" IFRS 9 Weighted ECL Rate: {weighted_ecl_rate:>11.2%}")
+print("\n Note: LGD and EAD are fixed assumptions. In a production")
+print(" IFRS 9 model, LGD would be estimated from historical")
+print(" recoveries and EAD from facility-level drawdown data.")
+
