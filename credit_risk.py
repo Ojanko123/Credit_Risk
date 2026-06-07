@@ -920,12 +920,22 @@ print("Saved: chart_08_psi.png")
 
 # 9. SHAP (if available)
 if SHAP_OK:
- plt.figure(figsize = (10,8))
- shap.summary_plot(shap_values, X_test_ohe, max_display=15, show= False)
- plt.title('SHAP Feature Importance - XGBOOST',
-           fontsize=13, fontweight='bold', pad = 15)
- plt.tight_layout()
- plt.show
+    # Compute mean absolute SHAP value per feature
+    shap_mean = np.abs(shap_values).mean(axis=0)
+    shap_series = pd.Series(shap_mean, index=X_test_ohe.columns)
+    shap_top = shap_series.sort_values(ascending=True).tail(15)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(shap_top.index, shap_top.values,
+                   color='steelblue', edgecolor='black', alpha=0.85)
+    ax.set_title('SHAP Feature Importance - XGBoost\n'
+                 'Mean |SHAP Value| across test set',
+                 fontsize=13, fontweight='bold', pad=15)
+    ax.set_xlabel('Mean |SHAP Value|', fontsize=11)
+    ax.bar_label(bars, fmt='%.4f', fontsize=8, padding=3)
+    ax.grid(True, alpha=0.3, axis='x')
+    plt.tight_layout()
+    plt.show()
 # PHASE 15: IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK
 # Three macroeconomic scenarios are applied with probability weights:
 # • Base (50%) - stable economic conditions
