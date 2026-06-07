@@ -158,7 +158,7 @@ Deployment-ready function returning three outputs for any new loan application:
 | Output | Description |
 |---|---|
 | Probability of Default | Model's estimated likelihood of default (0 to 1) |
-| Credit Score | Converted to 300–850 via the PDO formula |
+| Credit Score | Converted to 300-850 via the PDO formula |
 | Lending Decision | APPROVE / REVIEW / REJECT |
 
 Decision thresholds: PD < 20% --> Approve, 20–40% --> Review, > 40% --> Reject.
