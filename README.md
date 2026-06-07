@@ -183,13 +183,13 @@ Taken directly from the calibrated XGBoost model (Phase 8), adjusted per macroec
 
 ### LGD - Loss Given Default
 
-The fraction of the outstanding balance lost if the borrower defaults. LendingClub loans are unsecured consumer credit, where industry LGD typically ranges 60–75%. A tiered assumption is applied by loan size:
+The fraction of the outstanding balance lost if the borrower defaults. LendingClub loans are unsecured consumer credit, where industry LGD typically ranges 60-75%. A tiered assumption is applied by loan size:
 
 | Loan Amount | LGD |
 |---|---|
 | ≤ £5,000 | 60% |
-| £5,001–£15,000 | 65% |
-| £15,001–£25,000 | 70% |
+| £5,001-£15,000 | 65% |
+| £15,001-£25,000 | 70% |
 | > £25,000 | 75% |
 
 ### EAD - Exposure at Default
