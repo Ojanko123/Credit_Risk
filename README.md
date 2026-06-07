@@ -103,7 +103,7 @@ A second fit via Statsmodels produces full statistical output:
 
 - **Odds ratios:** > 1 increases default probability, < 1 decreases it
 - **P-values:** features with p > 0.05 are not significant at the 95% level
-- **McFadden Pseudo R² and AIC** for model fit assessment
+- **McFadden Pseudo R^2 and AIC** for model fit assessment
 
 ### Phase 8 - XGBoost (One-Hot Encoding, Hyperparameter Tuning)
 
