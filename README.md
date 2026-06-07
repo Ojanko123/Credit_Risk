@@ -17,7 +17,7 @@ This project directly addresses real-world credit risk questions:
 - **Source:** [LendingClub Issued Loans — Kaggle](https://www.kaggle.com/datasets/husainsb/lendingclub-issued-loans)
 - **Size:** 759,338 loans × 72 columns
 - **Period:** 2016-2017
-- **Target variable:** `loan_status` → binary (1 = Default/Charged Off/Late, 0 = Fully Paid)
+- **Target variable:** `loan_status` --> binary (1 = Default/Charged Off/Late, 0 = Fully Paid)
 
 ## Tools & Libraries
 
