@@ -920,15 +920,12 @@ print("Saved: chart_08_psi.png")
 
 # 9. SHAP (if available)
 if SHAP_OK:
-    fig, ax = plt.subplots(figsize=(10, 8))
-    shap.summary_plot(shap_values, X_test_ohe, max_display=15, show=False)
-    plt.title('SHAP Feature Importance - XGBoost',
-              fontsize=13, fontweight='bold', pad=15)
-    plt.tight_layout()
-    plt.savefig('chart_09_shap.png', dpi=150, bbox_inches='tight')
-    plt.show()
-    print("Saved: chart_09_shap.png")
-print("=" * 65)
+ plt.figure(figsize = (10,8))
+ shap.summary_plot(shap_values, X_test_ohe, max_display=15, show= False)
+ plt.title('SHAP Feature Importance - XGBOOST',
+           fontsize=13, fontweight='bold', pad = 15)
+ plt.tight_layout()
+ plt.show
 # PHASE 15: IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK
 # Three macroeconomic scenarios are applied with probability weights:
 # • Base (50%) - stable economic conditions
