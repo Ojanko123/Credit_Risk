@@ -149,7 +149,7 @@ Population Stability Index compares predicted probability distributions between 
 
 ### Phase 12 - SHAP Analysis
 
-SHAP values computed for the tuned XGBoost model. Summary plot shows which features drive default probability and by how much — providing the explainability regulators expect.
+SHAP values computed for the tuned XGBoost model. Summary plot shows which features drive default probability and by how much - providing the explainability regulators expect.
 
 ### Phase 13 - Prediction Function
 
