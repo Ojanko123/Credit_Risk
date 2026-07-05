@@ -97,7 +97,7 @@ Features with IV < 0.02 are excluded.
 
 ### Phase 7 - Logistic Regression (WoE Features)
 
-WoE encoding enforces monotonic relationships between features and default probability — a regulatory requirement in real bank models. Evaluated with AUC, Gini, KS statistic, and Brier score.
+WoE encoding enforces monotonic relationships between features and default probability - a regulatory requirement in real bank models. Evaluated with AUC, Gini, KS statistic, and Brier score.
 
 A second fit via Statsmodels produces full statistical output:
 
