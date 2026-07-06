@@ -35,7 +35,7 @@ https://www.kaggle.com/datasets/husainsb/lendingclub-issued-loans
 
 - 759,338 loans
 - 72 variables
-- 2016–2017 LendingClub consumer loans
+- 2016-2017 LendingClub consumer loans
 
 Target variable:
 
