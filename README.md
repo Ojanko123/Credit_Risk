@@ -258,7 +258,7 @@ Score = Offset + Factor × log(Odds)
 Resulting scores ranged approximately between:
 
 ```
-577–727
+577-727
 ```
 
 # Population Stability Index (PSI)
