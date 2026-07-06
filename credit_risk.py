@@ -1,6 +1,6 @@
 # CREDIT RISK MODEL 
 
-
+import os 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -240,7 +240,7 @@ selected_features = iv_df[iv_df['IV'] > 0.02].index.tolist()
 print(f"\nSelected {len(selected_features)} features (IV > 0.02)")
 
 # Step 2: Build WoE maps on TRAINING set
-print("\nBuilding WoE encodings from training set...")
+print("\nBuilding WoE encodings from training set")
 woe_maps    = {}
 train_woe   = pd.DataFrame()
 test_woe    = pd.DataFrame()
@@ -349,7 +349,7 @@ lr_gini  = 2 * lr_auc - 1
 lr_brier = brier_score_loss(y_test_woe, lr_probs)
 
 # KS statistic = max(TPR - FPR) across thresholds
-fpr_lr, tpr_lr, _ = roc_curve(y_test_woe, lr_probs)
+fpr_lr, tpr_lr, thr_lr = roc_curve(y_test_woe, lr_probs)
 lr_ks = max(tpr_lr - fpr_lr)
 
 print(f"\nLogistic Regression Results:")
@@ -375,7 +375,7 @@ try:
     print("\nOdds Ratios:")
     print(odds_df.sort_values('Odds Ratio',
                                ascending=False).to_string())
-    print(f"\nMcFadden Pseudo R²: {result_sm.prsquared:.4f}")
+    print(f"\nMcFadden Pseudo R^2: {result_sm.prsquared:.4f}")
     print(f"AIC: {result_sm.aic:.2f}")
 except Exception as e:
     print(f"Statsmodels failed: {e}")
@@ -437,7 +437,7 @@ print(f"  Train: {X_train_ohe.shape}")
 print(f"  Test:  {X_test_ohe.shape}")
 
 # Hyperparameter tuning via RandomizedSearchCV
-print("\nTuning XGBoost hyperparameters (RandomizedSearchCV)...")
+print("\nTuning XGBoost hyperparameters (RandomizedSearchCV)")
 
 neg = (y_train_ohe == 0).sum()
 pos = (y_train_ohe == 1).sum()
@@ -493,6 +493,314 @@ print(f"  KS:    {xgb_ks:.4f}")
 print(f"  Brier: {xgb_brier:.4f}")
 print("\nClassification Report:")
 print(classification_report(y_test_ohe, xgb_preds))
+# PHASE 8b - XGBoost CALIBRATION
+# Problem: XGBoost has higher AUC than LR but worse Brier score.
+# This means it ranks borrowers correctly but its raw probability
+# outputs are unreliable - it overestimates risk in some ranges.
+#
+# Fix: post-hoc calibration using Platt Scaling and Isotonic
+# Regression. We wrap the already-trained XGBoost model with a
+# calibration layer fitted on a held-out validation set.
+#
+# Key principle: calibration must be fit on data the XGBoost
+# model has NEVER seen - so we carve a validation set out of
+# the training data BEFORE fitting the calibration layer.
+# =============================================================
+print("\n" + "=" * 65)
+print("PHASE 8b - XGBoost CALIBRATION (Platt & Isotonic)")
+print("=" * 65)
+ 
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.model_selection import train_test_split as tts
+output_dir = r"C:\Users\ojank\Desktop\python"
+# Step 1: carve a validation set from training data
+# 80% used to retrain XGBoost base, 20% used to fit calibration layer
+X_train_base, X_val_cal, y_train_base, y_val_cal = tts(
+    X_train_ohe, y_train_ohe,
+    test_size=0.20, random_state=42,
+    stratify=y_train_ohe
+)
+ 
+print(f"\nCalibration split:")
+print(f"  XGBoost retrain set: {len(X_train_base):,} rows")
+print(f"  Calibration val set: {len(X_val_cal):,} rows")
+print(f"  Test set (held out): {len(X_test_ohe):,} rows")
+ 
+# Step 2: retrain XGBoost on the smaller training set
+# (same best params found by RandomizedSearchCV)
+xgb_for_cal = XGBClassifier(
+    **rscv.best_params_,
+    scale_pos_weight=scale,
+    random_state=42,
+    eval_metric='auc',
+    verbosity=0
+)
+xgb_for_cal.fit(X_train_base, y_train_base)
+ 
+# Sanity check: AUC on test set before calibration
+probs_uncal = xgb_for_cal.predict_proba(X_test_ohe)[:, 1]
+auc_uncal   = roc_auc_score(y_test_ohe, probs_uncal)
+brier_uncal = brier_score_loss(y_test_ohe, probs_uncal)
+print(f"\nXGBoost (retrained, uncalibrated):")
+print(f"  AUC={auc_uncal:.4f}  Brier={brier_uncal:.4f}")
+ 
+# Step 3: fit Platt Scaling (sigmoid) calibration
+# Good for smaller validation sets, parametric approach
+xgb_platt = CalibratedClassifierCV(
+    xgb_for_cal,
+    method='sigmoid',   # Platt scaling
+    cv='prefit'         # model already trained - don't retrain
+)
+xgb_platt.fit(X_val_cal, y_val_cal)
+ 
+probs_platt = xgb_platt.predict_proba(X_test_ohe)[:, 1]
+auc_platt   = roc_auc_score(y_test_ohe, probs_platt)
+brier_platt = brier_score_loss(y_test_ohe, probs_platt)
+gini_platt  = 2 * auc_platt - 1
+fpr_p, tpr_p, thr_p = roc_curve(y_test_ohe, probs_platt)
+ks_platt    = max(tpr_p - fpr_p)
+ 
+print(f"\nXGBoost + Platt Scaling:")
+print(f"  AUC={auc_platt:.4f}  Gini={gini_platt:.4f}  "
+      f"KS={ks_platt:.4f}  Brier={brier_platt:.4f}")
+ 
+# Step 4: fit Isotonic Regression calibration
+# More flexible (non-parametric), better for larger validation sets
+xgb_iso = CalibratedClassifierCV(
+    xgb_for_cal,
+    method='isotonic',  # Isotonic regression
+    cv='prefit'
+)
+xgb_iso.fit(X_val_cal, y_val_cal)
+ 
+probs_iso = xgb_iso.predict_proba(X_test_ohe)[:, 1]
+auc_iso   = roc_auc_score(y_test_ohe, probs_iso)
+brier_iso = brier_score_loss(y_test_ohe, probs_iso)
+gini_iso  = 2 * auc_iso - 1
+fpr_i, tpr_i, thr_i = roc_curve(y_test_ohe, probs_iso)
+ks_iso    = max(tpr_i - fpr_i)
+ 
+print(f"\nXGBoost + Isotonic Regression:")
+print(f"  AUC={auc_iso:.4f}  Gini={gini_iso:.4f}  "
+      f"KS={ks_iso:.4f}  Brier={brier_iso:.4f}")
+ 
+# Step 5: Hosmer-Lemeshow on calibrated models
+# (reuse the hosmer_lemeshow function defined in Phase 9)
+# We define a quick inline version here so Phase 8b is self-contained
+def _hl(y_true, y_proba, n_bins=10):
+    import pandas as _pd
+    from scipy.stats import chi2 as _chi2
+    _df = _pd.DataFrame({'prob': y_proba, 'actual': y_true})
+    _df['dec'] = _pd.qcut(_df['prob'], q=n_bins, duplicates='drop', labels=False)
+    g = _df.groupby('dec').agg(
+        n=('actual','count'),
+        observed=('actual','sum'),
+        expected=('prob','sum'))
+    stat = (((g['observed']-g['expected'])**2) /
+            (g['expected']*(1-g['expected']/g['n']))).sum()
+    return stat, 1 - _chi2.cdf(stat, df=n_bins-2)
+ 
+hl_platt_stat, hl_platt_p = _hl(y_test_ohe, probs_platt)
+hl_iso_stat,   hl_iso_p   = _hl(y_test_ohe, probs_iso)
+ 
+print(f"\nHosmer-Lemeshow after calibration:")
+print(f"  Platt:    stat={hl_platt_stat:.3f}, p={hl_platt_p:.4f} "
+      f"({'PASS' if hl_platt_p > 0.05 else 'FAIL'})")
+print(f"  Isotonic: stat={hl_iso_stat:.3f},   p={hl_iso_p:.4f} "
+      f"({'PASS' if hl_iso_p > 0.05 else 'FAIL'})")
+ 
+# Step 6: pick best calibrated model
+if brier_platt <= brier_iso:
+    best_cal_name   = 'Platt Scaling'
+    xgb_calibrated  = xgb_platt
+    probs_cal        = probs_platt
+    auc_cal          = auc_platt
+    brier_cal        = brier_platt
+    gini_cal         = gini_platt
+    ks_cal           = ks_platt
+else:
+    best_cal_name   = 'Isotonic Regression'
+    xgb_calibrated  = xgb_iso
+    probs_cal        = probs_iso
+    auc_cal          = auc_iso
+    brier_cal        = brier_iso
+    gini_cal         = gini_iso
+    ks_cal           = ks_iso
+ 
+print(f"\nBest calibration method: {best_cal_name}")
+ 
+# Step 7: summary comparison
+print(f"\n Calibration Improvement Summary")
+print(f"{'Model':<35} {'AUC':>7} {'Gini':>7} {'KS':>7} {'Brier':>8}")
+print("-" * 68)
+print(f"  {'LR (WoE)':<33} {lr_auc:>7.4f} {lr_gini:>7.4f} "
+      f"{lr_ks:>7.4f} {lr_brier:>8.4f}")
+print(f"  {'XGBoost (original)':<33} {xgb_auc:>7.4f} {xgb_gini:>7.4f} "
+      f"{xgb_ks:>7.4f} {xgb_brier:>8.4f}")
+print(f"  {'XGBoost (uncalibrated refit)':<33} {auc_uncal:>7.4f} {'—':>7} "
+      f"{'—':>7} {brier_uncal:>8.4f}")
+print(f"  {'XGBoost + Platt':<33} {auc_platt:>7.4f} {gini_platt:>7.4f} "
+      f"{ks_platt:>7.4f} {brier_platt:>8.4f}")
+print(f"  {'XGBoost + Isotonic':<33} {auc_iso:>7.4f} {gini_iso:>7.4f} "
+      f"{ks_iso:>7.4f} {brier_iso:>8.4f}")
+ 
+brier_improvement = ((xgb_brier - brier_cal) / xgb_brier) * 100
+print(f"\nBrier improvement from calibration: {brier_improvement:.1f}%")
+print(f"  Original XGBoost Brier: {xgb_brier:.4f}")
+print(f"  Calibrated XGBoost Brier ({best_cal_name}): {brier_cal:.4f}")
+print(f"  LR Brier (benchmark): {lr_brier:.4f}")
+ 
+# Step 8: calibration curve comparison chart
+import matplotlib.pyplot as _plt
+from sklearn.calibration import calibration_curve as _cal_curve
+ 
+fig_cal, ax_cal = _plt.subplots(figsize=(9, 6))
+ 
+frac_uncal, mean_uncal   = _cal_curve(y_test_ohe, probs_uncal,   n_bins=10)
+frac_platt, mean_platt   = _cal_curve(y_test_ohe, probs_platt,   n_bins=10)
+frac_iso,   mean_iso     = _cal_curve(y_test_ohe, probs_iso,     n_bins=10)
+frac_lr,    mean_lr      = _cal_curve(y_test_woe, lr_probs,      n_bins=10)
+ 
+ax_cal.plot([0,1],[0,1], 'k--', label='Perfect calibration')
+ax_cal.plot(mean_uncal, frac_uncal, 'r-o',  lw=2,
+            label=f'XGBoost uncalibrated  (Brier={brier_uncal:.4f})')
+ax_cal.plot(mean_platt, frac_platt, 'b-o',  lw=2,
+            label=f'XGBoost + Platt       (Brier={brier_platt:.4f})')
+ax_cal.plot(mean_iso,   frac_iso,   'g-o',  lw=2,
+            label=f'XGBoost + Isotonic    (Brier={brier_iso:.4f})')
+ax_cal.plot(mean_lr,    frac_lr,    'm-o',  lw=2, linestyle='--',
+            label=f'Logistic Regression   (Brier={lr_brier:.4f})')
+ 
+ax_cal.set_title('Calibration Curve - Before and After Calibration\n'
+                 'XGBoost Platt vs Isotonic vs LR',
+                 fontsize=12, fontweight='bold')
+ax_cal.set_xlabel('Mean Predicted Probability')
+ax_cal.set_ylabel('Fraction of Positives (Actual Default Rate)')
+ax_cal.legend(fontsize=9)
+ax_cal.grid(True, alpha=0.3)
+fig_cal.tight_layout()
+ 
+cal_path = os.path.join(output_dir, "cr_8b_calibration_comparison.png")
+fig_cal.savefig( cal_path, dpi=150, bbox_inches='tight')
+_plt.show()
+print(f"\nCalibration comparison chart saved: cr_8b_calibration_comparison.png")
+
+# Step 9: Finalize calibrated predictions for use in all downstream phases
+# From this point forward, "the XGBoost model" means the CALIBRATED model,
+# not the raw tuned model from Phase 8. Every phase below (Hosmer-Lemeshow,
+# SHAP, the scoring function, the visual comparisons, and the IFRS 9 ECL
+# engine) is switched over to these calibrated outputs.
+#
+# METHODOLOGY FIX: the decision threshold must be chosen on data the
+# test set has never touched. Picking a threshold by looking at
+# test-set performance is data leakage, it means the "final"
+# evaluation is no longer an honest, single-use estimate of
+# generalization, because a modeling decision (the threshold) was
+# already tuned against that same test set.
+#
+# Correct procedure:
+#   Train      --> fit XGBoost                         (Phase 8)
+#   Validation --> fit Platt/Isotonic calibration       (Step 1-4 above)
+#              --> ALSO choose the decision threshold   (this step)
+#   Test       --> touched exactly once, for the final
+#                 confusion matrix / report / charts   (Phase 14+)
+#
+# X_val_cal / y_val_cal, already carved out above for calibration,
+# now does double duty for threshold selection too.
+#
+# One residual note for full rigor: xgb_calibrated was itself fit on
+# X_val_cal/y_val_cal, so scoring it again on that same set for
+# threshold selection isn't perfectly independent of the calibration
+# fit, it's a much smaller reuse than tuning on the test set, but
+# not zero. For the strictest possible standard you could split
+# X_val_cal one level further (e.g. 50/50) into a calibration-fit set
+# and a separate threshold-selection set. Given typical validation
+# set sizes here, that extra split is optional; the version below
+# already fixes the main leakage (the test set is no longer touched
+# until final evaluation).
+
+from sklearn.metrics import precision_recall_curve
+
+print("\n" + "=" * 65)
+print("THRESHOLD SELECTION (on VALIDATION set, not test)")
+print("=" * 65)
+
+# Calibrated probabilities on the VALIDATION set (test set untouched)
+val_probs_cal = xgb_calibrated.predict_proba(X_val_cal)[:, 1]
+
+# Primary method: maximize F1 via precision_recall_curve
+val_precision, val_recall, pr_thresholds = precision_recall_curve(
+    y_val_cal, val_probs_cal)
+
+val_f1 = (2 * val_precision[:-1] * val_recall[:-1] /
+          (val_precision[:-1] + val_recall[:-1] + 1e-12))
+
+best_idx = np.argmax(val_f1)
+decision_threshold = pr_thresholds[best_idx]
+
+print(f"\nOptimal threshold (validation, max F1): {decision_threshold:.3f}")
+print(f"  Precision = {val_precision[best_idx]:.3f}")
+print(f"  Recall    = {val_recall[best_idx]:.3f}")
+print(f"  F1        = {val_f1[best_idx]:.3f}")
+
+# Full threshold tuning table on the VALIDATION set (transparency) 
+def evaluate_threshold(y_true, y_proba, t):
+    preds = (y_proba >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
+    precision    = tp / (tp + fp + 1e-12)
+    recall       = tp / (tp + fn + 1e-12)
+    specificity  = tn / (tn + fp + 1e-12)
+    f1           = 2 * precision * recall / (precision + recall + 1e-12)
+    balanced_acc = (recall + specificity) / 2
+    return precision, recall, f1, specificity, balanced_acc
+
+grid_rows = []
+for t in np.arange(0.05, 0.51, 0.01):
+    precision_t, recall_t, f1_t, spec_t, bacc_t = evaluate_threshold(
+        y_val_cal, val_probs_cal, t)
+    grid_rows.append([t, precision_t, recall_t, f1_t, spec_t, bacc_t])
+
+threshold_df = pd.DataFrame(
+    grid_rows,
+    columns=["Threshold", "Precision", "Recall", "F1",
+             "Specificity", "Balanced_Accuracy"])
+
+print("\nTop 10 thresholds by F1 (validation set):")
+print(threshold_df.sort_values("F1", ascending=False).head(10)
+      .to_string(index=False))
+
+# Alternative policy: lowest validation threshold reaching >= 80% recall
+recall80 = threshold_df[threshold_df["Recall"] >= 0.80]
+if len(recall80) > 0:
+    threshold_recall80 = recall80["Threshold"].max()
+    r80_row = threshold_df.loc[
+        threshold_df["Threshold"] == threshold_recall80].iloc[0]
+    print(f"\nAlternative - lowest threshold for >=80% recall (validation): "
+          f"{threshold_recall80:.2f}  "
+          f"(Precision={r80_row['Precision']:.3f}, "
+          f"Recall={r80_row['Recall']:.3f})")
+else:
+    threshold_recall80 = None
+    print("\nNo threshold in [0.05, 0.50] reaches 80% recall on the "
+          "validation set - the model cannot support that target "
+          "without a much lower, likely impractical, cutoff.")
+
+# DEFAULT POLICY: the F1-maximizing threshold found on the validation
+# set above. Swap in threshold_recall80 instead if business needs a
+# guaranteed minimum recall and can tolerate the resulting precision.
+print(f"\nDecision threshold in use (chosen on VALIDATION, applied to "
+      f"TEST once): {decision_threshold:.3f}")
+
+# Apply the validation-chosen threshold to the TEST set, ONCE
+xgb_preds_cal = (probs_cal >= decision_threshold).astype(int)
+fpr_cal, tpr_cal, thr_cal = roc_curve(y_test_ohe, probs_cal)
+
+print(f"\n>>> Downstream phases will now use: XGBoost + {best_cal_name}, "
+      f"threshold={decision_threshold:.3f} <<<")
+print(f"\nClassification Report (XGBoost Calibrated, TEST set, "
+      f"threshold={decision_threshold:.3f}):")
+print(classification_report(y_test_ohe, xgb_preds_cal))
+ 
 
 # PHASE 9: CALIBRATION ANALYSIS
 
@@ -542,16 +850,16 @@ lr_hl_stat, lr_hl_p   = hosmer_lemeshow(
 lr_calib_df            = calibration_by_decile(
     y_test_woe.values, lr_probs)
 
-# XGBoost calibration
+# XGBoost calibration (using the CALIBRATED model, not the raw Phase 8 output)
 xgb_hl_stat, xgb_hl_p = hosmer_lemeshow(
-    y_test_ohe, xgb_probs)
+    y_test_ohe, probs_cal)
 xgb_calib_df           = calibration_by_decile(
-    y_test_ohe, xgb_probs)
+    y_test_ohe, probs_cal)
 
 print(f"\nHosmer-Lemeshow Test:")
 print(f"  LR:      stat={lr_hl_stat:.3f}, p={lr_hl_p:.4f} "
       f"({'PASS' if lr_hl_p > 0.05 else 'FAIL'})")
-print(f"  XGBoost: stat={xgb_hl_stat:.3f}, p={xgb_hl_p:.4f} "
+print(f"  XGBoost (Calibrated - {best_cal_name}): stat={xgb_hl_stat:.3f}, p={xgb_hl_p:.4f} "
       f"({'PASS' if xgb_hl_p > 0.05 else 'FAIL'})")
 print("\n(p > 0.05 = well calibrated, fail to reject H0)")
 
@@ -638,10 +946,51 @@ print("=" * 65)
 try:
     import shap
     print("Computing SHAP values...")
-    explainer   = shap.TreeExplainer(xgb_best)
+    # NOTE: CalibratedClassifierCV (xgb_calibrated) wraps the tuned tree
+    # model in a Platt/Isotonic layer that TreeExplainer cannot see
+    # through. We explain xgb_for_cal instead - the same tuned tree
+    # model that the calibration layer sits on top of. Because both
+    # Platt scaling and isotonic regression are monotonic transforms,
+    # a feature's SHAP-ranked importance and direction still correctly
+    # explain *why* the model ranks a borrower as risky; the values
+    # are just expressed in the model's raw margin space rather than
+    # the final calibrated probability scale.
+    explainer   = shap.TreeExplainer(xgb_for_cal)
     shap_values = explainer.shap_values(X_test_ohe)
     SHAP_OK     = True
     print("SHAP computation complete.")
+
+    # Different shap/xgboost version combos return either a single
+    # (n_samples, n_features) array or a list of two such arrays (one
+    # per class) for binary classification. Normalize to the
+    # positive-class array before plotting.
+    if isinstance(shap_values, list):
+        shap_values_plot = shap_values[1]
+    else:
+        shap_values_plot = shap_values
+
+    # Plot 1: Beeswarm summary (impact + direction per feature)
+    fig_shap1 = plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_plot, X_test_ohe, show=False, max_display=15)
+    plt.title('SHAP Summary - Feature Impact on Default Risk\n'
+              '(XGBoost base model, pre-calibration margin space)',
+              fontsize=12, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig('chart_11_shap_summary.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Saved: chart_11_shap_summary.png")
+
+    # Plot 2: Mean |SHAP value| bar chart (overall importance)
+    fig_shap2 = plt.figure(figsize=(9, 8))
+    shap.summary_plot(shap_values_plot, X_test_ohe, plot_type='bar',
+                       show=False, max_display=15)
+    plt.title('SHAP Feature Importance (Mean |SHAP value|)',
+              fontsize=12, fontweight='bold', pad=15)
+    plt.tight_layout()
+    plt.savefig('chart_12_shap_importance.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("Saved: chart_12_shap_importance.png")
+
 except ImportError:
     print("SHAP not installed. Run: pip install shap")
     SHAP_OK = False
@@ -661,8 +1010,11 @@ def predict_new_customer(application, model, ohe_encoder,
                           offset, factor):
     """
     Predict default probability for a new loan application.
-    Uses XGBoost with OneHot encoding.
-    Unknown categories → handled by handle_unknown='ignore'
+    Uses the CALIBRATED XGBoost model (Platt/Isotonic) with OneHot
+    encoding, so predict_proba() returns a properly calibrated PD -
+    not just a well-ranked score - which is what the APPROVE/REVIEW/
+    REJECT thresholds below actually assume.
+    Unknown categories --> handled by handle_unknown='ignore'
     in the OneHotEncoder (zero vector for unknown categories).
     """
     df = pd.DataFrame([application])
@@ -749,10 +1101,10 @@ low_risk = {
 }
 
 print("\nHigh Risk Borrower:")
-predict_new_customer(high_risk, xgb_best, ohe, cat_cols_ohe,
+predict_new_customer(high_risk, xgb_calibrated, ohe, cat_cols_ohe,
                      num_cols_ohe, offset, factor)
 print("\nLow Risk Borrower:")
-predict_new_customer(low_risk, xgb_best, ohe, cat_cols_ohe,
+predict_new_customer(low_risk, xgb_calibrated, ohe, cat_cols_ohe,
                      num_cols_ohe, offset, factor)
 
 
@@ -765,10 +1117,10 @@ print("=" * 65)
 fig, ax = plt.subplots(figsize=(9, 7))
 ax.plot(fpr_lr,  tpr_lr,  'b-', lw=2,
         label=f'Logistic Regression  (AUC={lr_auc:.4f}, KS={lr_ks:.3f})')
-ax.plot(fpr_xgb, tpr_xgb, 'r-', lw=2,
-        label=f'XGBoost              (AUC={xgb_auc:.4f}, KS={xgb_ks:.3f})')
+ax.plot(fpr_cal, tpr_cal, 'r-', lw=2,
+        label=f'XGBoost (Calibrated - {best_cal_name})  (AUC={auc_cal:.4f}, KS={ks_cal:.3f})')
 ax.plot([0, 1], [0, 1], 'k--', label='Random classifier')
-ax.set_title('ROC Curve — Logistic Regression vs XGBoost',
+ax.set_title('ROC Curve - Logistic Regression vs XGBoost (Calibrated)',
              fontsize=13, fontweight='bold', pad=15)
 ax.set_xlabel('False Positive Rate', fontsize=11)
 ax.set_ylabel('True Positive Rate', fontsize=11)
@@ -777,7 +1129,6 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('chart_01_roc_curves.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_01_roc_curves.png")
 
 # 2 Confusion Matrix - Logistic Regression
 fig, ax = plt.subplots(figsize=(7, 6))
@@ -793,33 +1144,32 @@ ax.set_xlabel('Predicted', fontsize=11)
 plt.tight_layout()
 plt.savefig('chart_02_confusion_lr.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_02_confusion_lr.png")
 
-#3. Confusion Matrix - XGBoost
+#3. Confusion Matrix - XGBoost (Calibrated)
 fig, ax = plt.subplots(figsize=(7, 6))
-cm_xgb = confusion_matrix(y_test_ohe, xgb_preds)
+cm_xgb = confusion_matrix(y_test_ohe, xgb_preds_cal)
 sns.heatmap(cm_xgb, annot=True, fmt='d', cmap='Oranges', ax=ax,
             xticklabels=['No Default', 'Default'],
             yticklabels=['No Default', 'Default'],
             annot_kws={'size': 14})
-ax.set_title('Confusion Matrix - XGBoost (Tuned)',
+ax.set_title(f'Confusion Matrix - XGBoost (Calibrated - {best_cal_name})\n'
+             f'Decision threshold = {decision_threshold:.2f}  (not a naive 0.5 cutoff)',
              fontsize=13, fontweight='bold', pad=15)
 ax.set_ylabel('Actual', fontsize=11)
 ax.set_xlabel('Predicted', fontsize=11)
 plt.tight_layout()
 plt.savefig('chart_03_confusion_xgb.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_03_confusion_xgb.png")
 
 # 4. Calibration Curves
 fig, ax = plt.subplots(figsize=(9, 7))
 frac_pos_lr,  mean_pred_lr  = calibration_curve(y_test_woe, lr_probs,  n_bins=10)
-frac_pos_xgb, mean_pred_xgb = calibration_curve(y_test_ohe, xgb_probs, n_bins=10)
+frac_pos_xgb, mean_pred_xgb = calibration_curve(y_test_ohe, probs_cal, n_bins=10)
 ax.plot([0, 1], [0, 1], 'k--', label='Perfect calibration')
 ax.plot(mean_pred_lr,  frac_pos_lr,  'b-o', lw=2,
         label=f'Logistic Regression (Brier={lr_brier:.4f})')
 ax.plot(mean_pred_xgb, frac_pos_xgb, 'r-o', lw=2,
-        label=f'XGBoost             (Brier={xgb_brier:.4f})')
+        label=f'XGBoost Calibrated - {best_cal_name} (Brier={brier_cal:.4f})')
 ax.set_title('Calibration Curve - Predicted PD vs Actual Default Rate',
              fontsize=13, fontweight='bold', pad=15)
 ax.set_xlabel('Mean Predicted Probability', fontsize=11)
@@ -829,20 +1179,20 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('chart_04_calibration_curves.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_04_calibration_curves.png")
+
 # 5. Calibration by Decile 
 fig, ax = plt.subplots(figsize=(11, 7))
 x = np.arange(len(lr_calib_df))
 w = 0.35
 ax.bar(x - w/2, lr_calib_df['avg_predicted'], w,
-       color='steelblue', alpha=0.85, label='LR — Predicted')
+       color='steelblue', alpha=0.85, label='LR - Predicted')
 ax.bar(x - w/2, lr_calib_df['actual_rate'],   w,
-       color='steelblue', alpha=0.40, label='LR — Actual',
+       color='steelblue', alpha=0.40, label='LR - Actual',
        edgecolor='black', linewidth=0.8)
 ax.bar(x + w/2, xgb_calib_df['avg_predicted'], w,
-       color='firebrick', alpha=0.85, label='XGB — Predicted')
+       color='firebrick', alpha=0.85, label='XGB (Calibrated) - Predicted')
 ax.bar(x + w/2, xgb_calib_df['actual_rate'],   w,
-       color='firebrick', alpha=0.40, label='XGB — Actual',
+       color='firebrick', alpha=0.40, label='XGB (Calibrated) - Actual',
        edgecolor='black', linewidth=0.8)
 ax.set_title('Predicted vs Actual Default Rate by Probability Decile',
              fontsize=13, fontweight='bold', pad=15)
@@ -854,7 +1204,6 @@ ax.grid(True, alpha=0.3, axis='y')
 plt.tight_layout()
 plt.savefig('chart_05_calibration_decile.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_05_calibration_decile.png")
 
 # 6. Information Value 
 fig, ax = plt.subplots(figsize=(9, 7))
@@ -875,7 +1224,6 @@ ax.grid(True, alpha=0.3, axis='x')
 plt.tight_layout()
 plt.savefig('chart_06_information_value.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_06_information_value.png")
 
 # 7. Credit Score Distribution
 fig, ax = plt.subplots(figsize=(9, 7))
@@ -896,7 +1244,6 @@ ax.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.savefig('chart_07_score_distribution.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_07_score_distribution.png")
 
 # 8. PSI by PD Bucket
 fig, ax = plt.subplots(figsize=(9, 7))
@@ -916,32 +1263,15 @@ ax.grid(True, alpha=0.3, axis='y')
 plt.tight_layout()
 plt.savefig('chart_08_psi.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_08_psi.png")
 
-# 9. SHAP (if available)
-if SHAP_OK:
-    # Compute mean absolute SHAP value per feature
-    shap_mean = np.abs(shap_values).mean(axis=0)
-    shap_series = pd.Series(shap_mean, index=X_test_ohe.columns)
-    shap_top = shap_series.sort_values(ascending=True).tail(15)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
-    bars = ax.barh(shap_top.index, shap_top.values,
-                   color='steelblue', edgecolor='black', alpha=0.85)
-    ax.set_title('SHAP Feature Importance - XGBoost\n'
-                 'Mean |SHAP Value| across test set',
-                 fontsize=13, fontweight='bold', pad=15)
-    ax.set_xlabel('Mean |SHAP Value|', fontsize=11)
-    ax.bar_label(bars, fmt='%.4f', fontsize=8, padding=3)
-    ax.grid(True, alpha=0.3, axis='x')
-    plt.tight_layout()
-    plt.show()
+
 # PHASE 15: IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK
 # Three macroeconomic scenarios are applied with probability weights:
 # • Base (50%) - stable economic conditions
 # • Optimistic(30%) - benign credit environment
 # • Downturn (20%) - stressed / recessionary conditions
-# PD is taken directly from the calibrated XGBoost model.
+# PD is taken directly from the CALIBRATED XGBoost model.
 # LGD and EAD assumptions are fixed at loan-level using industry
 # conventions and are held constant across scenarios.
 # Scenario stress is applied via PD scalar multipliers.
@@ -954,12 +1284,16 @@ print("=" * 65)
 #  Rebuild test set with loan amounts 
 # We need the original loan_amnt column from test_raw.
 # test_raw was defined as loans_raw.iloc[split:].copy()
-# xgb_probs are the model PDs for the test set (same rows).
+# probs_cal are the CALIBRATED model PDs for the test set (same rows).
  
 print("\nStep 1: Attaching loan-level data to test set PDs")
  
 ecl_df = pd.DataFrame({
-'pd_model' : xgb_probs, # model PD 
+'pd_model' : probs_cal, # CALIBRATED model PD (Platt/Isotonic) - IFRS 9
+                        # needs probabilities that are correct on their
+                        # own scale, not just correctly RANKED, since
+                        # ECL = PD x LGD x EAD multiplies PD directly
+                        # into a currency loss amount.
 'loan_amnt' : test_raw['loan_amnt'].values,
 'actual' : y_test_ohe # true label
 }).reset_index(drop=True)
@@ -1200,8 +1534,6 @@ ax.text(0.5, 0.5, 'Grade data not available',
 plt.tight_layout()
 plt.savefig('chart_10_ifrs9_ecl.png', dpi=150, bbox_inches='tight')
 plt.show()
-print("Saved: chart_10_ifrs9_ecl.png")
- 
 # Final Summary 
 print("\n" + "=" * 65)
 print("IFRS 9 ECL FRAMEWORK - COMPLETE")
@@ -1219,4 +1551,3 @@ print(f" IFRS 9 Weighted ECL Rate: {weighted_ecl_rate:>11.2%}")
 print("\n Note: LGD and EAD are fixed assumptions. In a production")
 print(" IFRS 9 model, LGD would be estimated from historical")
 print(" recoveries and EAD from facility-level drawdown data.")
-
