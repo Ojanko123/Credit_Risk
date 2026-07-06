@@ -270,7 +270,7 @@ Interpretation:
 | PSI | Meaning |
 |------|----------|
 | <0.10 | Stable |
-| 0.10–0.20 | Moderate Shift |
+| 0.10-0.20 | Moderate Shift |
 | >0.20 | Significant Shift |
 
 SHAP values were computed for the calibrated XGBoost model.
