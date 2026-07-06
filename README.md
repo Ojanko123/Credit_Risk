@@ -168,7 +168,7 @@ Additionally:
 
 - Odds Ratios
 - p-values
-- McFadden Pseudo R²
+- McFadden Pseudo R^2
 - AIC
 
 were produced using Statsmodels.
