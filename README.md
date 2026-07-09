@@ -3,25 +3,27 @@
 
 ## Overview
 
-This project implements an end-to-end credit risk modelling pipeline using the LendingClub loan dataset, following many of the modelling principles used in modern banking and financial institutions.
+This project implements an end-to-end credit risk modelling pipeline using the LendingClub loan dataset.
 
-The objective is to estimate the Probability of Default (PD) of loan applicants, compare an interpretable regulatory-style scorecard against a machine learning model, calibrate predicted probabilities, optimise lending decision thresholds and finally estimate portfolio-level Expected Credit Loss (ECL) under an IFRS 9 framework.
+The objective is to estimate borrower Probability of Default (PD), develop a traditional banking-style credit scorecard, compare interpretable statistical modelling against machine learning approaches, calibrate predicted probabilities, optimise lending decision thresholds and estimate portfolio-level Expected Credit Loss (ECL) under an IFRS 9 inspired framework.
 
-The project demonstrates the complete lifecycle of a credit risk model, from raw data through deployment-ready predictions.
+The project demonstrates the complete lifecycle of a credit risk model:
+
+Raw data --> Data cleaning --> Feature engineering --> WoE scorecard --> Machine learning model --> Calibration --> Credit scoring --> Portfolio risk estimation.
 
 
-## Business Objectives
+# Business Objectives
 
-The project answers several real-world credit risk questions:
+The project addresses several real-world credit risk questions:
 
 - What is the probability that a borrower will default?
-- Which borrower characteristics are most predictive of default?
-- How well do Logistic Regression and XGBoost compare?
-- Are predicted probabilities well calibrated?
-- What lending threshold should be used?
-- How stable is the model across different populations?
-- What credit score should be assigned to a new borrower?
-- What is the Expected Credit Loss (ECL) under different macroeconomic scenarios?
+- Which borrower characteristics are strongest predictors of credit risk?
+- How does a traditional scorecard compare against gradient boosting?
+- Are predicted probabilities reliable enough for risk decisions?
+- What lending cutoff should be used?
+- How stable is the model over time?
+- How can PD estimates be translated into credit scores?
+- What is the expected portfolio loss under different economic scenarios?
 
 # Dataset
 
@@ -31,200 +33,228 @@ LendingClub Issued Loans (Kaggle)
 
 https://www.kaggle.com/datasets/husainsb/lendingclub-issued-loans
 
-**Original Dataset**
+
+## Original Dataset
 
 - 759,338 loans
 - 72 variables
-- 2016-2017 LendingClub consumer loans
+- LendingClub consumer loans issued during 2016-2017
+
+
+## Target Definition
+
+The modelling population excludes loans with unknown outcomes.
+
+Current loans are removed because their final repayment status is unavailable.
 
 Target variable:
 
 | Value | Meaning |
-|-------|---------|
+|------|---------|
 | 0 | Fully Paid |
-| 1 | Charged Off / Default / Late (>16 days) |
+| 1 | Charged Off / Default / Late (31-120 days) |
 
-Loans with status **Current** were removed because their final outcome is unknown.
+Loans classified as **Late (16-30 days)** were excluded because they represent an early delinquency state without a confirmed final outcome.
+
+Final modelling dataset:
+
+- 183,305 loans
+- Default rate: 28.69%
 
 # Technologies
 
 | Library | Purpose |
-|----------|----------|
-| Pandas | Data cleaning & manipulation |
+|---------|---------|
+| Pandas | Data processing |
 | NumPy | Numerical computation |
-| Scikit-learn | Model training & evaluation |
-| Statsmodels | Logistic Regression statistical analysis |
-| XGBoost | Gradient Boosting |
-| SHAP | Explainable AI |
+| Scikit-learn | Modelling and evaluation |
+| Statsmodels | Statistical logistic regression analysis |
+| XGBoost | Gradient boosting model |
+| SHAP | Model explainability |
 | SciPy | Statistical testing |
-| Matplotlib | Visualisations |
+| Matplotlib | Visualisation |
 
 # Methodology
 
-## Phase 1 - Data Loading & Exploration
+## Phase 1 - Data Cleaning
 
-- Load LendingClub dataset
-- Explore class distribution
-- Examine missing values
-- Understand borrower characteristics
+The dataset was prepared using only information available at loan origination.
 
-## Phase 2 - Feature Selection
+Cleaning steps included:
 
-Columns were selected according to two rules:
+- Missing value treatment
+- Percentage conversion
+- Employment length transformation
+- Date processing
+- Removal of leakage variables
 
-- Available at loan origination
-- No information leakage
+Numerical missing values were imputed using a 5% trimmed mean to reduce sensitivity to extreme observations.
 
-Target variable:
+Categorical missing values were replaced using the most frequent category.
 
-```
-1 = Default
-0 = Fully Paid
-```
+# Phase 2 - Feature Engineering
 
-Current loans were excluded.
+Business-driven credit risk variables were created.
 
-## Phase 3 - Data Cleaning
-
-Missing values:
-
-### Numerical
-
-Filled using **5% Trimmed Mean**
-
-Advantages:
-
-- robust to outliers
-- more informative than median
-- less biased than mean
-
-### Categorical
-
-Filled using mode.
-
-Additional cleaning included:
-
-- converting employment length to integers
-- percentage strings to floats
-- date conversion
-- 
-## Phase 4 - Feature Engineering
-
-Nine business-driven variables were created.
-
-| Feature | Business Interpretation |
-|----------|-------------------------|
-| loan_to_income | Loan burden |
-| payment_to_income | Monthly affordability |
+| Feature | Interpretation |
+|---------|---------------|
+| loan_to_income | Loan burden relative to income |
 | revol_to_income | Revolving debt burden |
-| has_delinq | Previous delinquency |
-| has_pub_rec | Public records |
-| high_inq | Aggressive credit seeking |
-| high_revol_util | High credit utilisation |
-| issue_month | Seasonality |
-| issue_quarter | Seasonality |
+| payment_to_income | Monthly repayment affordability |
+| has_delinq | Previous delinquency indicator |
+| has_pub_rec | Public record indicator |
+| high_inq | Aggressive credit search behaviour |
+| high_revol_util | High utilisation indicator |
+| issue_month | Origination seasonality |
+| issue_quarter | Origination quarter |
 
-## Phase 5 - Time-Based Train/Test Split
+After feature engineering:
 
-Rather than using a random split, loans were divided chronologically.
+- 27 total variables
+
+Highly correlated variables were removed using training-set correlations.
+
+Dropped:
+
+- issue_quarter
+- payment_to_income
+
+# Phase 3 - Time Based Train/Test Split
+
+A chronological split was used instead of a random split.
+
+This better represents real credit model deployment, where future borrowers must be predicted using historical information.
 
 Training:
-80%
+
+- 146,644 observations
 
 Testing:
-20%
 
-This prevents future information leaking into historical observations.
+- 36,661 observations
 
+Default rate:
 
-## Phase 6 - Weight of Evidence (WoE)
+| Dataset | Default Rate |
+|---------|-------------|
+| Train | 28.21% |
+| Test | 30.62% |
 
-Weight of Evidence encoding was built using **training data only**.
+# Phase 4 - Weight of Evidence (WoE) Scorecard
 
-Information Value (IV) was calculated for every feature.
+A traditional banking scorecard approach was implemented.
 
-Variables with
+WoE transformations were created using training data only.
+
+Information Value (IV) was calculated for every variable.
+
+Features with:
 
 ```
 IV < 0.02
 ```
 
-were discarded.
+were removed.
 
-This follows traditional regulatory scorecard development.
+Selected variables:
 
-## Phase 7 - Logistic Regression
+- 10 features
 
-A scorecard model was fitted using WoE-transformed variables.
+Strongest predictors:
 
-Evaluation metrics included:
+| Feature | IV |
+|---------|----|
+| grade | 0.359 |
+| int_rate | 0.354 |
+| loan_to_income | 0.127 |
+| dti | 0.099 |
+| revol_util | 0.079 |
+
+# Phase 5 - Logistic Regression Scorecard
+
+A WoE transformed logistic regression model was developed following traditional credit scorecard methodology.
+
+Evaluation metrics:
 
 - ROC AUC
-- Gini
-- KS Statistic
-- Brier Score
-
-Additionally:
-
-- Odds Ratios
-- p-values
-- McFadden Pseudo R^2
+- Gini coefficient
+- KS statistic
+- Brier score
+- Odds ratios
+- Statistical significance
+- McFadden pseudo R²
 - AIC
 
-were produced using Statsmodels.
 
-# Machine Learning Model
+Results:
 
-## Phase 8 - XGBoost
+| Metric | Logistic Regression |
+|--------|---------------------|
+| AUC | 0.7109 |
+| Gini | 0.4219 |
+| KS | 0.3099 |
+| Brier Score | 0.1881 |
 
-Categorical variables were One-Hot encoded.
 
-Hyperparameters were optimised using RandomizedSearchCV.
+McFadden pseudo R²:
 
-Parameters tuned included:
+```
+0.0842
+```
 
-- n_estimators
-- max_depth
-- learning_rate
-- subsample
-- colsample_bytree
-- min_child_weight
+---
 
-Evaluation:
+# Phase 6 - XGBoost Machine Learning Model
 
-- ROC AUC
-- Gini
-- KS
-- Brier Score
-- Classification Report
+A gradient boosting model was developed using one-hot encoded variables.
 
-# Probability Calibration
+Categorical variables were encoded without imposing artificial ordering.
 
-## Phase 8b - Calibration
+Hyperparameter optimisation was performed using RandomizedSearchCV.
 
-Tree-based models typically produce poorly calibrated probabilities.
+Optimised parameters:
 
-Two calibration techniques were evaluated:
+```
+n_estimators = 400
+max_depth = 3
+learning_rate = 0.1
+subsample = 0.8
+colsample_bytree = 0.7
+min_child_weight = 1
+```
+
+Cross-validation AUC:
+
+```
+0.7136
+```
+
+---
+
+# Phase 7 - Probability Calibration
+
+Tree-based models often rank borrowers well but their raw probabilities may not represent true default frequencies.
+
+Two calibration approaches were tested:
 
 - Platt Scaling
 - Isotonic Regression
 
-A dedicated validation dataset was used to avoid leakage.
+Calibration was performed using a separate validation dataset to avoid leakage.
 
-Calibration quality was evaluated using:
+The best calibration method was selected using Brier Score.
 
-- Calibration Curves
-- Brier Score
-- Hosmer-Lemeshow Test
-- Calibration by Deciles
+Selected method:
 
-The best calibration model was automatically selected.
+```
+Platt Scaling
+```
 
-# Threshold Optimisation
+# Phase 8 - Threshold Optimisation
 
-Rather than using the default 0.50 threshold, the classification threshold was selected using the validation dataset.
+The classification threshold was not set to the default 0.50.
 
-The following metrics were evaluated:
+A validation dataset was used to evaluate different thresholds based on:
 
 - Precision
 - Recall
@@ -232,219 +262,325 @@ The following metrics were evaluated:
 - Specificity
 - Balanced Accuracy
 
-The threshold that maximised F1-score was selected and applied once to the independent test set.
 
-This mirrors production credit decision systems where lending cut-offs are chosen according to business objectives rather than arbitrary defaults.
-
-# Calibration Analysis
-
-Model calibration was analysed using:
-
-- Calibration Curves
-- Probability Deciles
-- Hosmer-Lemeshow Test
-- Brier Score
-
-This provides both graphical and statistical validation of probability quality.
-
-# Credit Scorecard
-
-Predicted probabilities were converted into an industry-style credit score using the standard Points-to-Double-Odds (PDO) methodology.
+The F1-optimal threshold was:
 
 ```
-Score = Offset + Factor × log(Odds)
+0.29
 ```
 
-Resulting scores ranged approximately between:
+with:
+
+- Precision: 42.3%
+- Recall: 66.4%
+- F1-score: 51.7%
+
+
+However, credit risk decisions have asymmetric costs.
+
+Failing to identify a future defaulter is generally more costly than incorrectly rejecting a good borrower.
+
+Therefore, a more conservative threshold was selected:
 
 ```
-577-727
+Final Decision Threshold = 0.25
 ```
+
+Performance:
+
+- Precision: 39.6%
+- Recall: 73.6%
+- F1-score: 51.5%
+- Balanced Accuracy: 64.7%
+
+The threshold sacrifices almost no overall performance while improving default detection.
+
+# Model Comparison
+
+| Model | AUC | Gini | KS | Brier |
+|------|-----|------|----|-------|
+| Logistic Regression | 0.7109 | 0.4219 | 0.3099 | 0.1881 |
+| XGBoost + Platt Scaling | **0.7187** | **0.4374** | **0.3196** | 0.1881 |
+
+XGBoost achieved superior discriminatory power while maintaining comparable probability calibration.
+
+---
+
+# Calibration Diagnostics
+
+Calibration was evaluated using:
+
+- Calibration curves
+- Probability deciles
+- Brier score
+- Hosmer-Lemeshow test
+
+
+Hosmer-Lemeshow:
+
+```
+Logistic Regression: FAIL
+XGBoost: FAIL
+```
+
+The failure reflects the large sample size and sensitivity of the test rather than poor ranking performance.
+
+Additional calibration plots and decile analysis are provided.
+
+
+# Credit Scorecard Scaling
+
+Predicted probabilities were converted into an industry-style credit score.
+
+The standard Points-To-Double-Odds methodology was applied:
+
+```
+Score = Offset + Factor × log(Good Odds)
+```
+
+Parameters:
+
+```
+PDO = 50
+Base Score = 600
+```
+
+The score uses:
+
+```
+Good : Bad Odds
+```
+
+so safer borrowers receive higher scores.
+
+Final score distribution:
+
+```
+Range: 447 - 784
+Mean: 609
+```
+
+Example predictions:
+
+High risk borrower:
+
+```
+PD = 68.44%
+Score = 477
+Decision = REJECT
+```
+
+Low risk borrower:
+
+```
+PD = 6.19%
+Score = 729
+Decision = APPROVE
+```
+
+---
 
 # Population Stability Index (PSI)
 
-Model stability was assessed by comparing the distribution of predicted probabilities between the training and testing populations.
+Model stability was evaluated by comparing predicted risk distributions between training and testing populations.
 
 Interpretation:
 
 | PSI | Meaning |
-|------|----------|
+|-----|---------|
 | <0.10 | Stable |
-| 0.10-0.20 | Moderate Shift |
-| >0.20 | Significant Shift |
+| 0.10-0.20 | Moderate shift |
+| >0.20 | Significant shift |
 
-SHAP values were computed for the calibrated XGBoost model.
+Result:
 
-SHAP visualisations identify:
+```
+PSI = 0.0048
+```
 
-- most influential variables
-- contribution of each feature
-- direction of impact on PD
+Interpretation:
+
+The model population remained highly stable.
+
+---
+
+# Explainable AI
+
+SHAP analysis was performed on the XGBoost model.
+
+The analysis identifies:
+
+- Most influential variables
+- Feature contribution direction
+- Borrower risk drivers
 
 # Prediction Engine
 
-A production-style prediction function was developed.
+A production-style scoring function was developed.
 
-For any new applicant it returns:
+For a new borrower it returns:
 
 - Probability of Default
 - Credit Score
 - Lending Decision
 
-using
+The function applies:
 
 - identical preprocessing
 - identical feature engineering
-- identical calibration
-- identical decision threshold
+- identical encoding
+- identical scoring methodology
 
-ensuring consistency between training and deployment.
+ensuring consistency between development and deployment.
 
 # IFRS 9 Expected Credit Loss Framework
 
-The calibrated Probability of Default model is integrated into an IFRS 9 Expected Credit Loss framework.
+The calibrated PD model was integrated into an IFRS 9 inspired Expected Credit Loss framework.
 
-The standard formula is applied:
+The calculation follows:
 
 ```
 ECL = PD × LGD × EAD
 ```
 
-where
+## Probability of Default (PD)
 
-### PD
+Obtained from the calibrated XGBoost model.
 
-Model-estimated calibrated probability of default.
+## Loss Given Default (LGD)
 
-### LGD
-
-Tiered assumptions based on loan amount.
+LGD assumptions were assigned based on loan amount:
 
 | Loan Amount | LGD |
-|-------------|------|
+|-------------|-----|
 | ≤ £5,000 | 60% |
 | £5,001–15,000 | 65% |
 | £15,001–25,000 | 70% |
 | > £25,000 | 75% |
 
-### EAD
+## Exposure at Default (EAD)
 
-Outstanding exposure assuming
+Estimated as:
 
 ```
 EAD = Loan Amount × 90%
 ```
 
-reflecting partial amortisation before default.
+assuming partial principal repayment before default.
+
+# Macroeconomic Scenario Analysis
+
+Three forward-looking scenarios were implemented:
+
+| Scenario | Weight | PD Multiplier |
+|----------|--------|---------------|
+| Optimistic | 30% | 0.75x |
+| Base | 50% | 1.00x |
+| Downturn | 20% | 1.50x |
+
+The final provision is calculated as a probability-weighted expected loss.
 
 ---
 
-## Macroeconomic Scenarios
+# IFRS 9 Results
 
-Three forward-looking scenarios were implemented.
+Portfolio:
 
-| Scenario | Weight | PD Multiplier |
-|-----------|---------|---------------|
-| Optimistic | 30% | 0.75× |
-| Base | 50% | 1.00× |
-| Downturn | 20% | 1.50× |
+```
+EAD: £514.5 million
+```
 
-The final IFRS 9 provision is computed as the probability-weighted average of the three scenarios.
+Weighted Expected Credit Loss:
 
-Portfolio ECL is also broken down by credit grade.
+```
+£100.9 million
+```
 
-# Model Results
+ECL Rate:
 
-| Metric | Logistic Regression | XGBoost | XGBoost + Platt |
-|---------|--------------------|----------------|----------------|
-| ROC AUC | 0.7097 | **0.7188** | **0.7185** |
-| Gini | 0.4195 | **0.4376** | **0.4371** |
-| KS | 0.3060 | **0.3197** | **0.3152** |
-| Brier Score | 0.1905 | 0.2064 | **0.1898** |
-| PSI | Stable | Stable | Stable |
+```
+19.61%
+```
 
-### IFRS 9 Portfolio Results
+The estimated loss rate is elevated because:
 
-- Portfolio EAD: **£525.4 million**
-- Weighted Expected Credit Loss: **£110.8 million**
-- Portfolio ECL Rate: **21.1%**
+- the default definition includes severe delinquency states
+- current unresolved loans were excluded
+- LGD and EAD assumptions are conservative
 
-# Visualisations
+# Visualisations Generated
 
-The pipeline automatically generates:
+The pipeline produces:
 
-- ROC Curves
-- Confusion Matrices
-- Calibration Curves
-- Calibration by Decile
-- Information Value Rankings
-- Credit Score Distribution
-- PSI Charts
-- SHAP Summary Plot
-- IFRS 9 ECL Charts
+- ROC curves
+- Confusion matrices
+- Calibration curves
+- Calibration by probability decile
+- Information Value ranking
+- Credit score distribution
+- PSI analysis
+- SHAP feature importance
+- IFRS 9 scenario analysis
 
 # Concepts Demonstrated
 
-- Credit Risk Modelling
-- Probability of Default (PD)
-- Data Leakage Prevention
-- Weight of Evidence (WoE)
-- Information Value (IV)
-- Logistic Regression Scorecards
-- Statistical Model Interpretation
+- Probability of Default Modelling
+- Credit Risk Analytics
+- Banking Scorecards
+- Weight of Evidence
+- Information Value
+- Logistic Regression
 - XGBoost
-- Hyperparameter Optimisation
-- Probability Calibration
+- Model Calibration
 - Platt Scaling
-- Isotonic Regression
 - Threshold Optimisation
 - ROC AUC
-- Gini
+- Gini Coefficient
 - KS Statistic
-- Precision / Recall / F1
 - Brier Score
-- Hosmer-Lemeshow Test
-- Credit Scorecard Scaling
-- Population Stability Index (PSI)
 - SHAP Explainability
+- Population Stability Index
+- Credit Score Scaling
 - IFRS 9 Expected Credit Loss
-- Macroeconomic Scenario Analysis
-- Portfolio Credit Risk Analytics
+- Scenario Analysis
 
 
 # How to Run
 
-1. Download the LendingClub dataset from Kaggle.
-
-2. Place the CSV file in the project directory.
-
-3. Install dependencies
+Install dependencies:
 
 ```bash
 pip install pandas numpy matplotlib scikit-learn statsmodels scipy xgboost shap
 ```
 
-4. Run
+Run:
 
 ```bash
 python credit_risk.py
 ```
 
+
 ---
 
 # Future Improvements
 
-- Bayesian Hyperparameter Optimisation
-- Monotonic XGBoost Constraints
-- Beta Calibration
+Possible extensions:
+
+- Bayesian hyperparameter optimisation
+- Monotonic gradient boosting constraints
+- Beta calibration
 - Expected Calibration Error (ECE)
-- Stage 1 / Stage 2 IFRS 9 modelling
 - Lifetime PD modelling
-- Survival Analysis
-- LGD model estimation from recoveries
-- EAD modelling using Credit Conversion Factors (CCF)
+- Stage 1 / Stage 2 IFRS 9 framework
+- Survival analysis
+- Dedicated LGD model using recovery data
+- EAD modelling using Credit Conversion Factors
 - Interactive dashboard deployment with Streamlit
 
-  Oresti Janko
-  Bsc Statistics and Insurance Science - University of Piraeus
-  Focus: Financial modelling, Credit risk modelling, Quantitative analysis, Python
+
+**Oresti Janko**
+
+BSc Statistics and Insurance Science - University of Piraeus
+
+Focus:
+Financial Modelling, Credit Risk Modelling, Quantitative Analysis, Python
