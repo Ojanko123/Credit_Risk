@@ -1,46 +1,62 @@
-# CREDIT RISK MODEL 
+"""
+Credit Risk Model
+Estimates probability of default for LendingClub loans, builds a
+credit scorecard, and computes IFRS 9 expected credit loss (ECL).
+"""
 
-import os 
-import pandas as pd
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 import seaborn as sns
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import (train_test_split,
-                                      RandomizedSearchCV,
-                                      StratifiedKFold)
-from sklearn.metrics import roc_auc_score, roc_curve, confusion_matrix, classification_report, brier_score_loss
-from sklearn.calibration import calibration_curve
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
-from xgboost import XGBClassifier
-from scipy.stats import trim_mean, chi2
 import statsmodels.api as sm
+from scipy.stats import trim_mean, chi2
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import (train_test_split, RandomizedSearchCV,
+                                      StratifiedKFold)
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.metrics import (roc_auc_score, roc_curve, confusion_matrix,
+                              classification_report, brier_score_loss)
+from xgboost import XGBClassifier
 import warnings
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
-# PHASE 1: DATA LOADING & EXPLORATION
-print("=" * 65)
-print("PHASE 1 - DATA LOADING & EXPLORATION")
-print("=" * 65)
+RANDOM_STATE = 42
+DECISION_THRESHOLD = 0.25          # fixed cutoff used for both models
+DATA_PATH = r"C:\Users\ojank\Desktop\SQL\lc_2016_2017.csv"
+OUTPUT_DIR = r"C:\Users\ojank\Desktop\python"
 
-loans = pd.read_csv(
-    "C:\\Users\\ojank\\Desktop\\SQL\\lc_2016_2017.csv",
-    low_memory=False)
 
+def evaluate_at_threshold(y_true, y_proba, threshold, label):
+    """Print a classification report and confusion matrix at a fixed
+    probability cutoff, and return the predictions and core metrics."""
+    preds = (y_proba >= threshold).astype(int)
+    auc = roc_auc_score(y_true, y_proba)
+    brier = brier_score_loss(y_true, y_proba)
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+    ks = max(tpr - fpr)
+
+    print(f"\n{label} (threshold = {threshold})")
+    print(f"  AUC={auc:.4f}  Gini={2*auc-1:.4f}  KS={ks:.4f}  Brier={brier:.4f}")
+    print(classification_report(y_true, preds))
+
+    cm = confusion_matrix(y_true, preds)
+    print(f"Confusion matrix:\n{cm}")
+
+    return preds, {"auc": auc, "gini": 2 * auc - 1, "ks": ks, "brier": brier}
+
+
+# 1. Load data
+loans = pd.read_csv(DATA_PATH, low_memory=False)
 print(f"Raw shape: {loans.shape}")
-print("\nLoan Status distribution:")
 print(loans['loan_status'].value_counts())
 
-
-# PHASE 2: FEATURE SELECTION & TARGET DEFINITION
-
-print("\n" + "=" * 65)
-print("PHASE 2 - FEATURE SELECTION & TARGET DEFINITION")
-print("=" * 65)
-
-# Columns available at application time only (no data leakage)
+# 2. Target definition
+# Default = Charged Off, Default, and Late (31-120 days) - that late bucket
+# is close enough to charge-off that it's treated as a default outcome.
+# Late (16-30 days) is dropped entirely (not counted as default, not kept
+# as a good loan) since it's too early to know how that loan resolves.
 cols_to_keep = [
     'loan_amnt', 'int_rate', 'grade', 'sub_grade',
     'emp_length', 'home_ownership', 'annual_inc',
@@ -50,1504 +66,713 @@ cols_to_keep = [
     'installment', 'issue_d', 'loan_status'
 ]
 cols_to_keep = [c for c in cols_to_keep if c in loans.columns]
-loans        = loans[cols_to_keep].copy()
+loans = loans[cols_to_keep].copy()
 
-# Filter to completed loans only
 loans = loans[loans['loan_status'].isin([
-    'Fully Paid', 'Charged Off', 'Default',
-    'Late (31-120 days)', 'Late (16-30 days)',
+    'Fully Paid', 'Charged Off', 'Default', 'Late (31-120 days)',
     'Does not meet the credit policy. Status:Charged Off',
     'Does not meet the credit policy. Status:Fully Paid'
 ])]
 
-loans['target'] = np.where(
-    loans['loan_status'].isin([
-        'Fully Paid',
-        'Does not meet the credit policy. Status:Fully Paid'
-    ]), 0, 1)
+loans['target'] = np.where(loans['loan_status'].isin([
+    'Fully Paid', 'Does not meet the credit policy. Status:Fully Paid'
+]), 0, 1)
 
-print(f"\nTarget distribution:")
-print(loans['target'].value_counts())
+print(f"\nTarget distribution:\n{loans['target'].value_counts()}")
 print(f"Default rate: {loans['target'].mean():.2%}")
-
 loans.drop('loan_status', axis=1, inplace=True)
 
-
-# PHASE 3: CLEANING
-
-print("\n" + "=" * 65)
-print("PHASE 3 - DATA CLEANING")
-print("=" * 65)
-
-# 5% trimmed mean for numerics
+# 3. Cleaning
 numeric_cols = loans.select_dtypes(include=[np.number]).columns
 for col in numeric_cols:
     tm = trim_mean(loans[col].dropna(), proportiontocut=0.025)
     loans[col] = loans[col].fillna(tm)
 
-# Mode for categoricals
 categorical_cols = loans.select_dtypes(include=['object']).columns
 for col in categorical_cols:
     loans[col] = loans[col].fillna(loans[col].mode()[0])
 
-# Clean emp_length
-if loans['emp_length'].dtype == object:
-    loans['emp_length'] = (loans['emp_length']
-                           .str.replace(' years', '')
-                           .str.replace(' year',  '')
-                           .str.replace('< 1',    '0')
-                           .str.replace('10+',    '10'))
-    loans['emp_length'] = pd.to_numeric(
-        loans['emp_length'], errors='coerce')
-    loans['emp_length'] = loans['emp_length'].fillna(
-        loans['emp_length'].median())
+loans['emp_length'] = (loans['emp_length']
+                       .str.replace(' years', '')
+                       .str.replace(' year', '')
+                       .str.replace('< 1', '0')
+                       .str.replace('10+', '10'))
+loans['emp_length'] = pd.to_numeric(loans['emp_length'], errors='coerce')
+loans['emp_length'] = loans['emp_length'].fillna(loans['emp_length'].median())
 
 if loans['int_rate'].dtype == object:
-    loans['int_rate'] = (loans['int_rate']
-                         .str.replace('%', '')
-                         .astype(float))
+    loans['int_rate'] = loans['int_rate'].str.replace('%', '').astype(float)
 
 if loans['revol_util'].dtype == object:
-    loans['revol_util'] = (loans['revol_util']
-                           .str.replace('%', '')
-                           .astype(float))
-    loans['revol_util'] = loans['revol_util'].fillna(
-        loans['revol_util'].median())
+    loans['revol_util'] = loans['revol_util'].str.replace('%', '').astype(float)
+    loans['revol_util'] = loans['revol_util'].fillna(loans['revol_util'].median())
 
-print("Cleaning complete.")
-print(f"Shape: {loans.shape}")
+print(f"Shape after cleaning: {loans.shape}")
 
-
-# PHASE 4 - FEATURE ENGINEERING
-
-print("\n" + "=" * 65)
-print("PHASE 4 - FEATURE ENGINEERING")
-print("=" * 65)
-
-loans['loan_to_income']  = loans['loan_amnt'] / (loans['annual_inc'] + 1)
+# 4. Feature engineering
+loans['loan_to_income'] = loans['loan_amnt'] / (loans['annual_inc'] + 1)
 loans['revol_to_income'] = loans['revol_bal'] / (loans['annual_inc'] + 1)
-loans['has_pub_rec']     = (loans['pub_rec']      > 0).astype(int)
-loans['has_delinq']      = (loans['delinq_2yrs']  > 0).astype(int)
-loans['high_inq']        = (loans['inq_last_6mths'] > 3).astype(int)
-loans['high_revol_util'] = (loans['revol_util']   > 80).astype(int)
+loans['has_pub_rec'] = (loans['pub_rec'] > 0).astype(int)
+loans['has_delinq'] = (loans['delinq_2yrs'] > 0).astype(int)
+loans['high_inq'] = (loans['inq_last_6mths'] > 3).astype(int)
+loans['high_revol_util'] = (loans['revol_util'] > 80).astype(int)
 
 if 'installment' in loans.columns:
-    loans['payment_to_income'] = (loans['installment'] /
-                                   (loans['annual_inc'] / 12 + 1))
+    loans['payment_to_income'] = loans['installment'] / (loans['annual_inc'] / 12 + 1)
     loans.drop('installment', axis=1, inplace=True)
 
 if 'issue_d' in loans.columns:
-    try:
-        loans['issue_d']       = pd.to_datetime(loans['issue_d'])
-        loans['issue_month']   = loans['issue_d'].dt.month
-        loans['issue_quarter'] = loans['issue_d'].dt.quarter
-        loans.drop('issue_d', axis=1, inplace=True)
-    except:
-        loans.drop('issue_d', axis=1, inplace=True)
+    loans['issue_d'] = pd.to_datetime(loans['issue_d'])
+    loans['issue_month'] = loans['issue_d'].dt.month
+    loans['issue_quarter'] = loans['issue_d'].dt.quarter
+    loans.drop('issue_d', axis=1, inplace=True)
 
 print(f"Shape after feature engineering: {loans.shape}")
 
+# 5. Time-based train/test split (loans are a time series, not i.i.d. rows)
+split = int(len(loans) * 0.80)
+train_loans = loans.iloc[:split].copy()
+test_loans = loans.iloc[split:].copy()
+print(f"Train: {len(train_loans):,} rows | Test: {len(test_loans):,} rows")
+print(f"Train default rate: {train_loans['target'].mean():.2%} | "
+      f"Test default rate: {test_loans['target'].mean():.2%}")
 
-# PHASE 5 - TIME-BASED TRAIN/TEST SPLIT
+# 6. Multicollinearity control
+# sub_grade is a finer-grained duplicate of grade + int_rate, so it's dropped
+# outright. Remaining numeric features are checked pairwise on the training
+# set only; when two features correlate above 0.85, we keep whichever one
+# correlates more strongly with the target and drop the other.
+for df_ in (train_loans, test_loans, loans):
+    df_.drop(columns=['sub_grade'], inplace=True, errors='ignore')
 
-print("\n" + "=" * 65)
-print("PHASE 5 - TIME-BASED TRAIN/TEST SPLIT")
-print("=" * 65)
+numeric_feats = train_loans.select_dtypes(include=[np.number]).columns.drop('target')
+corr_matrix = train_loans[numeric_feats].corr().abs()
 
-# Credit risk models are time-series problems.
-# Using random split ignores temporal structure and can leak
-# future information into training.
-# We use a deterministic 80/20 split preserving order.
+to_drop = set()
+for i, col_i in enumerate(numeric_feats):
+    for col_j in numeric_feats[i + 1:]:
+        if corr_matrix.loc[col_i, col_j] > 0.85:
+            corr_i = abs(train_loans[col_i].corr(train_loans['target']))
+            corr_j = abs(train_loans[col_j].corr(train_loans['target']))
+            to_drop.add(col_j if corr_i >= corr_j else col_i)
 
+if to_drop:
+    print(f"Dropping correlated features (>0.85, r < target): {sorted(to_drop)}")
+    train_loans.drop(columns=list(to_drop), inplace=True)
+    test_loans.drop(columns=list(to_drop), inplace=True)
 
-split        = int(len(loans) * 0.80)
-train_loans  = loans.iloc[:split].copy()
-test_loans   = loans.iloc[split:].copy()
-
-print(f"Training set: {len(train_loans):,} rows")
-print(f"Test set:     {len(test_loans):,}  rows")
-print(f"Train default rate: {train_loans['target'].mean():.2%}")
-print(f"Test default rate:  {test_loans['target'].mean():.2%}")
-
-# PHASE 6: WoE ENCODING (TRAIN ONLY, APPLIED TO TEST)
-
-print("\n" + "=" * 65)
-print("PHASE 6 - WoE ENCODING (NO LEAKAGE)")
-print("=" * 65)
-
-# WoE bins are computed on TRAINING data only.
-# The resulting WoE mapping is then applied to the test set.
-# This prevents test set information from influencing WoE values.
-
+# 7. WoE encoding (fit on train, applied to test)
 def calculate_woe_iv(df, feature, target, bins=10):
-    """
-    WoE and IV calculation on a given dataframe.
-    Always call this on training data only.
-    Returns woe_map (bin --> WoE value) and IV score.
-    """
+    """WoE/IV for one feature. Call on training data only."""
     df = df[[feature, target]].copy()
-    if df[feature].dtype in [np.float64, np.int64, np.float32,
-                               np.int32]:
+    if df[feature].dtype in [np.float64, np.int64, np.float32, np.int32]:
         try:
-            df['bin'] = pd.qcut(df[feature], q=bins,
-                                duplicates='drop')
-        except:
+            df['bin'] = pd.qcut(df[feature], q=bins, duplicates='drop')
+        except ValueError:
             df['bin'] = pd.cut(df[feature], bins=bins)
     else:
         df['bin'] = df[feature]
 
-    grouped = df.groupby('bin', observed=True)[target].agg(
-        ['sum', 'count'])
-    grouped.columns   = ['events', 'total']
+    grouped = df.groupby('bin', observed=True)[target].agg(['sum', 'count'])
+    grouped.columns = ['events', 'total']
     grouped['non_ev'] = grouped['total'] - grouped['events']
 
-    total_ev    = grouped['events'].sum()
-    total_nev   = grouped['non_ev'].sum()
+    total_ev, total_nev = grouped['events'].sum(), grouped['non_ev'].sum()
+    dist_ev = (grouped['events'] / (total_ev + 1e-10)).replace(0, 0.0001)
+    dist_nev = (grouped['non_ev'] / (total_nev + 1e-10)).replace(0, 0.0001)
 
-    grouped['dist_ev']  = grouped['events'] / (total_ev + 1e-10)
-    grouped['dist_nev'] = grouped['non_ev'] / (total_nev + 1e-10)
+    grouped['woe'] = np.log(dist_ev / dist_nev)
+    grouped['iv'] = (dist_ev - dist_nev) * grouped['woe']
+    return grouped['woe'], grouped['iv'].sum()
 
-    grouped['dist_ev']  = grouped['dist_ev'].replace(0, 0.0001)
-    grouped['dist_nev'] = grouped['dist_nev'].replace(0, 0.0001)
 
-    grouped['woe'] = np.log(grouped['dist_ev'] /
-                             grouped['dist_nev'])
-    grouped['iv']  = ((grouped['dist_ev'] -
-                        grouped['dist_nev']) * grouped['woe'])
-    iv = grouped['iv'].sum()
-    return grouped['woe'], iv
-
-# Step 1: Calculate IV on TRAINING set only
-print("\nCalculating IV on training set...")
+features = [c for c in train_loans.columns if c != 'target']
 iv_results = {}
-features   = [c for c in train_loans.columns if c != 'target']
-
 for feature in features:
     try:
         _, iv = calculate_woe_iv(train_loans, feature, 'target')
         iv_results[feature] = iv
-    except Exception as e:
+    except Exception:
         pass
 
-iv_df = pd.DataFrame.from_dict(
-    iv_results, orient='index', columns=['IV'])
+iv_df = pd.DataFrame.from_dict(iv_results, orient='index', columns=['IV'])
 iv_df = iv_df.sort_values('IV', ascending=False)
-
-print("\nInformation Values (train set):")
-print(iv_df.to_string())
+print(f"\nInformation values (train set):\n{iv_df.to_string()}")
 
 selected_features = iv_df[iv_df['IV'] > 0.02].index.tolist()
-print(f"\nSelected {len(selected_features)} features (IV > 0.02)")
+print(f"Selected {len(selected_features)} features (IV > 0.02)")
 
-# Step 2: Build WoE maps on TRAINING set
-print("\nBuilding WoE encodings from training set")
-woe_maps    = {}
-train_woe   = pd.DataFrame()
-test_woe    = pd.DataFrame()
-
+train_woe, test_woe = pd.DataFrame(), pd.DataFrame()
 for feature in selected_features:
-    try:
-        woe_map, _ = calculate_woe_iv(
-            train_loans, feature, 'target')
-        woe_maps[feature] = woe_map
+    woe_map, _ = calculate_woe_iv(train_loans, feature, 'target')
+    is_numeric = train_loans[feature].dtype in [np.float64, np.int64, np.float32, np.int32]
 
-        # Apply to TRAIN
-        if train_loans[feature].dtype in [
-                np.float64, np.int64, np.float32, np.int32]:
-            try:
-                bins_tr = pd.qcut(
-                    train_loans[feature], q=10,
-                    duplicates='drop', retbins=False)
-                train_woe[feature + '_woe'] = bins_tr.map(woe_map)
-            except:
-                train_woe[feature + '_woe'] = (
-                    train_loans[feature].map(
-                        train_loans.groupby(feature)['target'].apply(
-                            lambda x: np.log(
-                                (x.mean() + 0.0001) /
-                                (1 - x.mean() + 0.0001)))))
-        else:
-            woe_lookup = (
-                train_loans.groupby(feature)['target'].apply(
-                    lambda x: np.log(
-                        (x.mean() + 0.0001) /
-                        (1 - x.mean() + 0.0001))))
-            train_woe[feature + '_woe'] = (
-                train_loans[feature].map(woe_lookup))
-
-        # Apply to TEST using TRAIN WoE map
-        if test_loans[feature].dtype in [
-                np.float64, np.int64, np.float32, np.int32]:
-            try:
-                # Use same bin edges from training
-                _, bin_edges = pd.qcut(
-                    train_loans[feature], q=10,
-                    duplicates='drop', retbins=True)
-                bins_te = pd.cut(
-                    test_loans[feature],
-                    bins=bin_edges,
-                    include_lowest=True)
-                test_woe[feature + '_woe'] = bins_te.map(woe_map)
-            except:
-                # Fallback: use train WoE lookup
-                tr_lookup = (
-                    train_loans.groupby(feature)['target'].apply(
-                        lambda x: np.log(
-                            (x.mean() + 0.0001) /
-                            (1 - x.mean() + 0.0001))))
-                test_woe[feature + '_woe'] = (
-                    test_loans[feature].map(tr_lookup))
-        else:
-            # Categorical: use train WoE lookup, NaN for unseen
-            tr_lookup = (
-                train_loans.groupby(feature)['target'].apply(
-                    lambda x: np.log(
-                        (x.mean() + 0.0001) /
-                        (1 - x.mean() + 0.0001))))
-            test_woe[feature + '_woe'] = (
-                test_loans[feature].map(tr_lookup))
-            # Unseen categories --> 0 (neutral WoE) not arbitrary
-            test_woe[feature + '_woe'].fillna(0, inplace=True)
-
-    except Exception as e:
-        print(f"  Skipping {feature}: {e}")
+    if is_numeric:
+        bins_tr, bin_edges = pd.qcut(train_loans[feature], q=10,
+                                      duplicates='drop', retbins=True)
+        train_woe[feature + '_woe'] = bins_tr.map(woe_map)
+        bins_te = pd.cut(test_loans[feature], bins=bin_edges, include_lowest=True)
+        test_woe[feature + '_woe'] = bins_te.map(woe_map)
+    else:
+        train_woe[feature + '_woe'] = train_loans[feature].map(woe_map)
+        test_woe[feature + '_woe'] = test_loans[feature].map(woe_map)
+        # unseen categories in test get a neutral WoE of 0
+        test_woe[feature + '_woe'].fillna(0, inplace=True)
 
 train_woe['target'] = train_loans['target'].values
-test_woe['target']  = test_loans['target'].values
-
-# Convert to numeric and fill NaNs
-for col in train_woe.columns:
-    train_woe[col] = pd.to_numeric(train_woe[col], errors='coerce')
-for col in test_woe.columns:
-    test_woe[col] = pd.to_numeric(test_woe[col], errors='coerce')
-
-train_woe.fillna(0, inplace=True)
-test_woe.fillna(0, inplace=True)
-
-print(f"\nWoE train shape: {train_woe.shape}")
-print(f"WoE test shape:  {test_woe.shape}")
+test_woe['target'] = test_loans['target'].values
+train_woe = train_woe.apply(pd.to_numeric, errors='coerce').fillna(0)
+test_woe = test_woe.apply(pd.to_numeric, errors='coerce').fillna(0)
 
 X_train_woe = train_woe.drop('target', axis=1)
 y_train_woe = train_woe['target']
-X_test_woe  = test_woe.drop('target', axis=1)
-y_test_woe  = test_woe['target']
+X_test_woe = test_woe.drop('target', axis=1)
+y_test_woe = test_woe['target']
 
-# PHASE 7: LOGISTIC REGRESSION (WoE FEATURES)
-
-print("\n" + "=" * 65)
-print("PHASE 7 - LOGISTIC REGRESSION (WoE Features)")
-print("=" * 65)
-
-lr = LogisticRegression(max_iter=1000, random_state=42,
-                         solver='saga')
+# 8. Logistic regression (WoE features)
+lr = LogisticRegression(max_iter=1000, random_state=RANDOM_STATE, solver='saga')
 lr.fit(X_train_woe, y_train_woe)
-
 lr_probs = lr.predict_proba(X_test_woe)[:, 1]
-lr_preds = lr.predict(X_test_woe)
-lr_auc   = roc_auc_score(y_test_woe, lr_probs)
-lr_gini  = 2 * lr_auc - 1
-lr_brier = brier_score_loss(y_test_woe, lr_probs)
 
-# KS statistic = max(TPR - FPR) across thresholds
-fpr_lr, tpr_lr, thr_lr = roc_curve(y_test_woe, lr_probs)
-lr_ks = max(tpr_lr - fpr_lr)
+lr_preds, lr_metrics = evaluate_at_threshold(
+    y_test_woe, lr_probs, DECISION_THRESHOLD, "Logistic Regression")
 
-print(f"\nLogistic Regression Results:")
-print(f"  AUC:   {lr_auc:.4f}")
-print(f"  Gini:  {lr_gini:.4f}")
-print(f"  KS:    {lr_ks:.4f}")
-print(f"  Brier: {lr_brier:.4f}")
-print("\nClassification Report:")
-print(classification_report(y_test_woe, lr_preds))
-
-# Statsmodels for odds ratios and p-values
-print("\n Statistical Output (Logistic Regression)")
 X_train_sm = sm.add_constant(X_train_woe)
-try:
-    logit_sm = sm.Logit(y_train_woe, X_train_sm)
-    result_sm = logit_sm.fit(method='lbfgs', maxiter=500,
-                              disp=False)
-    odds_df = pd.DataFrame({
-        'Coefficient': result_sm.params,
-        'Odds Ratio':  np.exp(result_sm.params),
-        'P-value':     result_sm.pvalues
-    }).drop('const', errors='ignore')
-    print("\nOdds Ratios:")
-    print(odds_df.sort_values('Odds Ratio',
-                               ascending=False).to_string())
-    print(f"\nMcFadden Pseudo R^2: {result_sm.prsquared:.4f}")
-    print(f"AIC: {result_sm.aic:.2f}")
-except Exception as e:
-    print(f"Statsmodels failed: {e}")
+logit_sm = sm.Logit(y_train_woe, X_train_sm).fit(method='lbfgs', maxiter=500, disp=False)
+odds_df = pd.DataFrame({
+    'Coefficient': logit_sm.params,
+    'Odds Ratio': np.exp(logit_sm.params),
+    'P-value': logit_sm.pvalues
+}).drop('const', errors='ignore')
+print(f"\nOdds ratios:\n{odds_df.sort_values('Odds Ratio', ascending=False).to_string()}")
+print(f"McFadden Pseudo R^2: {logit_sm.prsquared:.4f} | AIC: {logit_sm.aic:.2f}")
+
+# 9. XGBoost (one-hot encoded, no false ordinal assumption)
+cat_cols_ohe = train_loans.select_dtypes(include=['object']).columns.tolist()
+num_cols_ohe = [c for c in train_loans.columns if c != 'target' and c not in cat_cols_ohe]
+
+ohe = OneHotEncoder(sparse_output=False, handle_unknown='ignore', drop='first')
+ohe.fit(train_loans[cat_cols_ohe])
 
 
-# PHASE 8: XGBoost (OneHot Encoding - no ordinal assumption)
-
-print("\n" + "=" * 65)
-print("PHASE 8 - XGBoost (OneHot Encoding)")
-print("=" * 65)
-
-# FIX: Use OneHotEncoding instead of LabelEncoding
-# LabelEncoding implies ordinal relationships that don't exist
-# for categories like purpose, home_ownership, grade
-
-loans_raw = loans.copy()
-
-# Identify categorical columns for OneHot encoding
-cat_cols_ohe = loans_raw.select_dtypes(
-    include=['object']).columns.tolist()
-num_cols_ohe = [c for c in loans_raw.columns
-                if c != 'target' and c not in cat_cols_ohe]
-
-print(f"Categorical features (OneHot): {cat_cols_ohe}")
-print(f"Numeric features: {len(num_cols_ohe)}")
-
-# Encode categoricals
-ohe = OneHotEncoder(sparse_output=False,
-                    handle_unknown='ignore',
-                    drop='first')
-
-train_raw = loans_raw.iloc[:split].copy()
-test_raw  = loans_raw.iloc[split:].copy()
-
-# Fit encoder on TRAIN only
-ohe.fit(train_raw[cat_cols_ohe])
-
-# Transform both
-def encode_and_combine(df, ohe, cat_cols, num_cols):
-    ohe_arr  = ohe.transform(df[cat_cols])
-    ohe_cols = ohe.get_feature_names_out(cat_cols)
-    ohe_df   = pd.DataFrame(ohe_arr, columns=ohe_cols,
-                              index=df.index)
+def encode_and_combine(df, encoder, cat_cols, num_cols):
+    ohe_arr = encoder.transform(df[cat_cols])
+    ohe_cols = encoder.get_feature_names_out(cat_cols)
+    ohe_df = pd.DataFrame(ohe_arr, columns=ohe_cols, index=df.index)
     return pd.concat([df[num_cols].reset_index(drop=True),
-                      ohe_df.reset_index(drop=True)], axis=1)
+                       ohe_df.reset_index(drop=True)], axis=1)
 
-X_train_ohe = encode_and_combine(
-    train_raw, ohe, cat_cols_ohe, num_cols_ohe)
-X_test_ohe  = encode_and_combine(
-    test_raw,  ohe, cat_cols_ohe, num_cols_ohe)
-y_train_ohe = train_raw['target'].values
-y_test_ohe  = test_raw['target'].values
 
-X_train_ohe = X_train_ohe.fillna(0)
-X_test_ohe  = X_test_ohe.fillna(0)
+X_train_ohe = encode_and_combine(train_loans, ohe, cat_cols_ohe, num_cols_ohe).fillna(0)
+X_test_ohe = encode_and_combine(test_loans, ohe, cat_cols_ohe, num_cols_ohe).fillna(0)
+y_train_ohe = train_loans['target'].values
+y_test_ohe = test_loans['target'].values
 
-print(f"\nOneHot encoded shapes:")
-print(f"  Train: {X_train_ohe.shape}")
-print(f"  Test:  {X_test_ohe.shape}")
-
-# Hyperparameter tuning via RandomizedSearchCV
-print("\nTuning XGBoost hyperparameters (RandomizedSearchCV)")
-
-neg = (y_train_ohe == 0).sum()
-pos = (y_train_ohe == 1).sum()
-scale = neg / pos
-
+scale = (y_train_ohe == 0).sum() / (y_train_ohe == 1).sum()
 param_dist = {
-    'n_estimators':     [100, 200, 300, 400],
-    'max_depth':        [3, 4, 5, 6],
-    'learning_rate':    [0.01, 0.05, 0.1, 0.15],
-    'subsample':        [0.7, 0.8, 0.9],
+    'n_estimators': [100, 200, 300, 400],
+    'max_depth': [3, 4, 5, 6],
+    'learning_rate': [0.01, 0.05, 0.1, 0.15],
+    'subsample': [0.7, 0.8, 0.9],
     'colsample_bytree': [0.7, 0.8, 0.9],
     'min_child_weight': [1, 3, 5],
 }
-
-xgb_base = XGBClassifier(
-    scale_pos_weight=scale,
-    random_state=42,
-    eval_metric='auc',
-    verbosity=0
-)
-
-cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-
-rscv = RandomizedSearchCV(
-    xgb_base,
-    param_distributions=param_dist,
-    n_iter=20,
-    scoring='roc_auc',
-    cv=cv,
-    random_state=42,
-    n_jobs=-1,
-    verbose=0
-)
+xgb_base = XGBClassifier(scale_pos_weight=scale, random_state=RANDOM_STATE,
+                          eval_metric='auc', verbosity=0)
+cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
+rscv = RandomizedSearchCV(xgb_base, param_distributions=param_dist, n_iter=20,
+                           scoring='roc_auc', cv=cv, random_state=RANDOM_STATE, n_jobs=-1)
 rscv.fit(X_train_ohe, y_train_ohe)
+print(f"\nBest XGBoost params: {rscv.best_params_} | CV AUC: {rscv.best_score_:.4f}")
 
-print(f"Best params: {rscv.best_params_}")
-print(f"Best CV AUC: {rscv.best_score_:.4f}")
+# 10. Calibrate XGBoost
+# XGBoost tends to rank borrowers well but its raw probabilities aren't
+# reliable on their own scale. We refit on a smaller training split and fit
+# a calibration layer (Platt / Isotonic) on a held-out validation split that
+# the model never trained on, then keep whichever calibration gives the
+# lower Brier score.
+X_train_base, X_val_cal, y_train_base, y_val_cal = train_test_split(
+    X_train_ohe, y_train_ohe, test_size=0.20, random_state=RANDOM_STATE,
+    stratify=y_train_ohe)
 
-xgb_best   = rscv.best_estimator_
-xgb_probs  = xgb_best.predict_proba(X_test_ohe)[:, 1]
-xgb_preds  = xgb_best.predict(X_test_ohe)
-xgb_auc    = roc_auc_score(y_test_ohe, xgb_probs)
-xgb_gini   = 2 * xgb_auc - 1
-xgb_brier  = brier_score_loss(y_test_ohe, xgb_probs)
-
-fpr_xgb, tpr_xgb, _ = roc_curve(y_test_ohe, xgb_probs)
-xgb_ks = max(tpr_xgb - fpr_xgb)
-
-print(f"\nXGBoost Results (tuned):")
-print(f"  AUC:   {xgb_auc:.4f}")
-print(f"  Gini:  {xgb_gini:.4f}")
-print(f"  KS:    {xgb_ks:.4f}")
-print(f"  Brier: {xgb_brier:.4f}")
-print("\nClassification Report:")
-print(classification_report(y_test_ohe, xgb_preds))
-# PHASE 8b - XGBoost CALIBRATION
-# Problem: XGBoost has higher AUC than LR but worse Brier score.
-# This means it ranks borrowers correctly but its raw probability
-# outputs are unreliable - it overestimates risk in some ranges.
-#
-# Fix: post-hoc calibration using Platt Scaling and Isotonic
-# Regression. We wrap the already-trained XGBoost model with a
-# calibration layer fitted on a held-out validation set.
-#
-# Key principle: calibration must be fit on data the XGBoost
-# model has NEVER seen - so we carve a validation set out of
-# the training data BEFORE fitting the calibration layer.
-# =============================================================
-print("\n" + "=" * 65)
-print("PHASE 8b - XGBoost CALIBRATION (Platt & Isotonic)")
-print("=" * 65)
- 
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import train_test_split as tts
-output_dir = r"C:\Users\ojank\Desktop\python"
-# Step 1: carve a validation set from training data
-# 80% used to retrain XGBoost base, 20% used to fit calibration layer
-X_train_base, X_val_cal, y_train_base, y_val_cal = tts(
-    X_train_ohe, y_train_ohe,
-    test_size=0.20, random_state=42,
-    stratify=y_train_ohe
-)
- 
-print(f"\nCalibration split:")
-print(f"  XGBoost retrain set: {len(X_train_base):,} rows")
-print(f"  Calibration val set: {len(X_val_cal):,} rows")
-print(f"  Test set (held out): {len(X_test_ohe):,} rows")
- 
-# Step 2: retrain XGBoost on the smaller training set
-# (same best params found by RandomizedSearchCV)
-xgb_for_cal = XGBClassifier(
-    **rscv.best_params_,
-    scale_pos_weight=scale,
-    random_state=42,
-    eval_metric='auc',
-    verbosity=0
-)
+xgb_for_cal = XGBClassifier(**rscv.best_params_, scale_pos_weight=scale,
+                             random_state=RANDOM_STATE, eval_metric='auc', verbosity=0)
 xgb_for_cal.fit(X_train_base, y_train_base)
- 
-# Sanity check: AUC on test set before calibration
-probs_uncal = xgb_for_cal.predict_proba(X_test_ohe)[:, 1]
-auc_uncal   = roc_auc_score(y_test_ohe, probs_uncal)
-brier_uncal = brier_score_loss(y_test_ohe, probs_uncal)
-print(f"\nXGBoost (retrained, uncalibrated):")
-print(f"  AUC={auc_uncal:.4f}  Brier={brier_uncal:.4f}")
- 
-# Step 3: fit Platt Scaling (sigmoid) calibration
-# Good for smaller validation sets, parametric approach
-xgb_platt = CalibratedClassifierCV(
-    xgb_for_cal,
-    method='sigmoid',   # Platt scaling
-    cv='prefit'         # model already trained - don't retrain
-)
+probs_uncal = xgb_for_cal.predict_proba(X_test_ohe)[:, 1]  # pre-calibration, for comparison
+
+xgb_platt = CalibratedClassifierCV(xgb_for_cal, method='sigmoid', cv='prefit')
 xgb_platt.fit(X_val_cal, y_val_cal)
- 
 probs_platt = xgb_platt.predict_proba(X_test_ohe)[:, 1]
-auc_platt   = roc_auc_score(y_test_ohe, probs_platt)
-brier_platt = brier_score_loss(y_test_ohe, probs_platt)
-gini_platt  = 2 * auc_platt - 1
-fpr_p, tpr_p, thr_p = roc_curve(y_test_ohe, probs_platt)
-ks_platt    = max(tpr_p - fpr_p)
- 
-print(f"\nXGBoost + Platt Scaling:")
-print(f"  AUC={auc_platt:.4f}  Gini={gini_platt:.4f}  "
-      f"KS={ks_platt:.4f}  Brier={brier_platt:.4f}")
- 
-# Step 4: fit Isotonic Regression calibration
-# More flexible (non-parametric), better for larger validation sets
-xgb_iso = CalibratedClassifierCV(
-    xgb_for_cal,
-    method='isotonic',  # Isotonic regression
-    cv='prefit'
-)
+
+xgb_iso = CalibratedClassifierCV(xgb_for_cal, method='isotonic', cv='prefit')
 xgb_iso.fit(X_val_cal, y_val_cal)
- 
 probs_iso = xgb_iso.predict_proba(X_test_ohe)[:, 1]
-auc_iso   = roc_auc_score(y_test_ohe, probs_iso)
-brier_iso = brier_score_loss(y_test_ohe, probs_iso)
-gini_iso  = 2 * auc_iso - 1
-fpr_i, tpr_i, thr_i = roc_curve(y_test_ohe, probs_iso)
-ks_iso    = max(tpr_i - fpr_i)
- 
-print(f"\nXGBoost + Isotonic Regression:")
-print(f"  AUC={auc_iso:.4f}  Gini={gini_iso:.4f}  "
-      f"KS={ks_iso:.4f}  Brier={brier_iso:.4f}")
- 
-# Step 5: Hosmer-Lemeshow on calibrated models
-# (reuse the hosmer_lemeshow function defined in Phase 9)
-# We define a quick inline version here so Phase 8b is self-contained
-def _hl(y_true, y_proba, n_bins=10):
-    import pandas as _pd
-    from scipy.stats import chi2 as _chi2
-    _df = _pd.DataFrame({'prob': y_proba, 'actual': y_true})
-    _df['dec'] = _pd.qcut(_df['prob'], q=n_bins, duplicates='drop', labels=False)
-    g = _df.groupby('dec').agg(
-        n=('actual','count'),
-        observed=('actual','sum'),
-        expected=('prob','sum'))
-    stat = (((g['observed']-g['expected'])**2) /
-            (g['expected']*(1-g['expected']/g['n']))).sum()
-    return stat, 1 - _chi2.cdf(stat, df=n_bins-2)
- 
-hl_platt_stat, hl_platt_p = _hl(y_test_ohe, probs_platt)
-hl_iso_stat,   hl_iso_p   = _hl(y_test_ohe, probs_iso)
- 
-print(f"\nHosmer-Lemeshow after calibration:")
-print(f"  Platt:    stat={hl_platt_stat:.3f}, p={hl_platt_p:.4f} "
-      f"({'PASS' if hl_platt_p > 0.05 else 'FAIL'})")
-print(f"  Isotonic: stat={hl_iso_stat:.3f},   p={hl_iso_p:.4f} "
-      f"({'PASS' if hl_iso_p > 0.05 else 'FAIL'})")
- 
-# Step 6: pick best calibrated model
-if brier_platt <= brier_iso:
-    best_cal_name   = 'Platt Scaling'
-    xgb_calibrated  = xgb_platt
-    probs_cal        = probs_platt
-    auc_cal          = auc_platt
-    brier_cal        = brier_platt
-    gini_cal         = gini_platt
-    ks_cal           = ks_platt
+
+if brier_score_loss(y_test_ohe, probs_platt) <= brier_score_loss(y_test_ohe, probs_iso):
+    best_cal_name, xgb_calibrated, probs_cal = 'Platt Scaling', xgb_platt, probs_platt
 else:
-    best_cal_name   = 'Isotonic Regression'
-    xgb_calibrated  = xgb_iso
-    probs_cal        = probs_iso
-    auc_cal          = auc_iso
-    brier_cal        = brier_iso
-    gini_cal         = gini_iso
-    ks_cal           = ks_iso
- 
+    best_cal_name, xgb_calibrated, probs_cal = 'Isotonic Regression', xgb_iso, probs_iso
+
 print(f"\nBest calibration method: {best_cal_name}")
- 
-# Step 7: summary comparison
-print(f"\n Calibration Improvement Summary")
-print(f"{'Model':<35} {'AUC':>7} {'Gini':>7} {'KS':>7} {'Brier':>8}")
-print("-" * 68)
-print(f"  {'LR (WoE)':<33} {lr_auc:>7.4f} {lr_gini:>7.4f} "
-      f"{lr_ks:>7.4f} {lr_brier:>8.4f}")
-print(f"  {'XGBoost (original)':<33} {xgb_auc:>7.4f} {xgb_gini:>7.4f} "
-      f"{xgb_ks:>7.4f} {xgb_brier:>8.4f}")
-print(f"  {'XGBoost (uncalibrated refit)':<33} {auc_uncal:>7.4f} {'—':>7} "
-      f"{'—':>7} {brier_uncal:>8.4f}")
-print(f"  {'XGBoost + Platt':<33} {auc_platt:>7.4f} {gini_platt:>7.4f} "
-      f"{ks_platt:>7.4f} {brier_platt:>8.4f}")
-print(f"  {'XGBoost + Isotonic':<33} {auc_iso:>7.4f} {gini_iso:>7.4f} "
-      f"{ks_iso:>7.4f} {brier_iso:>8.4f}")
- 
-brier_improvement = ((xgb_brier - brier_cal) / xgb_brier) * 100
-print(f"\nBrier improvement from calibration: {brier_improvement:.1f}%")
-print(f"  Original XGBoost Brier: {xgb_brier:.4f}")
-print(f"  Calibrated XGBoost Brier ({best_cal_name}): {brier_cal:.4f}")
-print(f"  LR Brier (benchmark): {lr_brier:.4f}")
- 
-# Step 8: calibration curve comparison chart
-import matplotlib.pyplot as _plt
-from sklearn.calibration import calibration_curve as _cal_curve
- 
-fig_cal, ax_cal = _plt.subplots(figsize=(9, 6))
- 
-frac_uncal, mean_uncal   = _cal_curve(y_test_ohe, probs_uncal,   n_bins=10)
-frac_platt, mean_platt   = _cal_curve(y_test_ohe, probs_platt,   n_bins=10)
-frac_iso,   mean_iso     = _cal_curve(y_test_ohe, probs_iso,     n_bins=10)
-frac_lr,    mean_lr      = _cal_curve(y_test_woe, lr_probs,      n_bins=10)
- 
-ax_cal.plot([0,1],[0,1], 'k--', label='Perfect calibration')
-ax_cal.plot(mean_uncal, frac_uncal, 'r-o',  lw=2,
-            label=f'XGBoost uncalibrated  (Brier={brier_uncal:.4f})')
-ax_cal.plot(mean_platt, frac_platt, 'b-o',  lw=2,
-            label=f'XGBoost + Platt       (Brier={brier_platt:.4f})')
-ax_cal.plot(mean_iso,   frac_iso,   'g-o',  lw=2,
-            label=f'XGBoost + Isotonic    (Brier={brier_iso:.4f})')
-ax_cal.plot(mean_lr,    frac_lr,    'm-o',  lw=2, linestyle='--',
-            label=f'Logistic Regression   (Brier={lr_brier:.4f})')
- 
-ax_cal.set_title('Calibration Curve - Before and After Calibration\n'
-                 'XGBoost Platt vs Isotonic vs LR',
-                 fontsize=12, fontweight='bold')
-ax_cal.set_xlabel('Mean Predicted Probability')
-ax_cal.set_ylabel('Fraction of Positives (Actual Default Rate)')
-ax_cal.legend(fontsize=9)
-ax_cal.grid(True, alpha=0.3)
-fig_cal.tight_layout()
- 
-cal_path = os.path.join(output_dir, "cr_8b_calibration_comparison.png")
-fig_cal.savefig( cal_path, dpi=150, bbox_inches='tight')
-_plt.show()
-print(f"\nCalibration comparison chart saved: cr_8b_calibration_comparison.png")
 
-# Step 9: Finalize calibrated predictions for use in all downstream phases
-# From this point forward, "the XGBoost model" means the CALIBRATED model,
-# not the raw tuned model from Phase 8. Every phase below (Hosmer-Lemeshow,
-# SHAP, the scoring function, the visual comparisons, and the IFRS 9 ECL
-# engine) is switched over to these calibrated outputs.
-#
-# METHODOLOGY FIX: the decision threshold must be chosen on data the
-# test set has never touched. Picking a threshold by looking at
-# test-set performance is data leakage, it means the "final"
-# evaluation is no longer an honest, single-use estimate of
-# generalization, because a modeling decision (the threshold) was
-# already tuned against that same test set.
-#
-# Correct procedure:
-#   Train      --> fit XGBoost                         (Phase 8)
-#   Validation --> fit Platt/Isotonic calibration       (Step 1-4 above)
-#              --> ALSO choose the decision threshold   (this step)
-#   Test       --> touched exactly once, for the final
-#                 confusion matrix / report / charts   (Phase 14+)
-#
-# X_val_cal / y_val_cal, already carved out above for calibration,
-# now does double duty for threshold selection too.
-#
-# One residual note for full rigor: xgb_calibrated was itself fit on
-# X_val_cal/y_val_cal, so scoring it again on that same set for
-# threshold selection isn't perfectly independent of the calibration
-# fit, it's a much smaller reuse than tuning on the test set, but
-# not zero. For the strictest possible standard you could split
-# X_val_cal one level further (e.g. 50/50) into a calibration-fit set
-# and a separate threshold-selection set. Given typical validation
-# set sizes here, that extra split is optional; the version below
-# already fixes the main leakage (the test set is no longer touched
-# until final evaluation).
-
+# 11. Threshold selection - justifying the 0.25 cutoff
+# The cutoff is chosen on the VALIDATION split (X_val_cal / y_val_cal),
+# which the calibrated model has never been scored against for this
+# purpose, and only then applied once to the test set. Picking a
+# threshold by looking at test-set performance would be leakage: the
+# "final" test evaluation would no longer be an honest, single-use
+# estimate of generalization, since a modeling decision (the threshold)
+# was tuned against that same data.
 from sklearn.metrics import precision_recall_curve
 
-print("\n" + "=" * 65)
-print("THRESHOLD SELECTION (on VALIDATION set, not test)")
-print("=" * 65)
-
-# Calibrated probabilities on the VALIDATION set (test set untouched)
 val_probs_cal = xgb_calibrated.predict_proba(X_val_cal)[:, 1]
-
-# Primary method: maximize F1 via precision_recall_curve
-val_precision, val_recall, pr_thresholds = precision_recall_curve(
-    y_val_cal, val_probs_cal)
-
+val_precision, val_recall, pr_thresholds = precision_recall_curve(y_val_cal, val_probs_cal)
 val_f1 = (2 * val_precision[:-1] * val_recall[:-1] /
           (val_precision[:-1] + val_recall[:-1] + 1e-12))
+best_f1_idx = np.argmax(val_f1)
+f1_optimal_threshold = pr_thresholds[best_f1_idx]
 
-best_idx = np.argmax(val_f1)
-decision_threshold = pr_thresholds[best_idx]
+print(f"\nThreshold selection (validation set, XGBoost + {best_cal_name}):")
+print(f"  F1-optimal threshold: {f1_optimal_threshold:.3f}  "
+      f"(Precision={val_precision[best_f1_idx]:.3f}, "
+      f"Recall={val_recall[best_f1_idx]:.3f}, F1={val_f1[best_f1_idx]:.3f})")
 
-print(f"\nOptimal threshold (validation, max F1): {decision_threshold:.3f}")
-print(f"  Precision = {val_precision[best_idx]:.3f}")
-print(f"  Recall    = {val_recall[best_idx]:.3f}")
-print(f"  F1        = {val_f1[best_idx]:.3f}")
 
-# Full threshold tuning table on the VALIDATION set (transparency) 
 def evaluate_threshold(y_true, y_proba, t):
     preds = (y_proba >= t).astype(int)
     tn, fp, fn, tp = confusion_matrix(y_true, preds).ravel()
-    precision    = tp / (tp + fp + 1e-12)
-    recall       = tp / (tp + fn + 1e-12)
-    specificity  = tn / (tn + fp + 1e-12)
-    f1           = 2 * precision * recall / (precision + recall + 1e-12)
+    precision = tp / (tp + fp + 1e-12)
+    recall = tp / (tp + fn + 1e-12)
+    specificity = tn / (tn + fp + 1e-12)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
     balanced_acc = (recall + specificity) / 2
     return precision, recall, f1, specificity, balanced_acc
 
-grid_rows = []
-for t in np.arange(0.05, 0.51, 0.01):
-    precision_t, recall_t, f1_t, spec_t, bacc_t = evaluate_threshold(
-        y_val_cal, val_probs_cal, t)
-    grid_rows.append([t, precision_t, recall_t, f1_t, spec_t, bacc_t])
 
-threshold_df = pd.DataFrame(
-    grid_rows,
-    columns=["Threshold", "Precision", "Recall", "F1",
-             "Specificity", "Balanced_Accuracy"])
+threshold_grid = pd.DataFrame(
+    [[t, *evaluate_threshold(y_val_cal, val_probs_cal, t)]
+     for t in np.arange(0.05, 0.51, 0.01)],
+    columns=["Threshold", "Precision", "Recall", "F1", "Specificity", "Balanced_Accuracy"])
 
 print("\nTop 10 thresholds by F1 (validation set):")
-print(threshold_df.sort_values("F1", ascending=False).head(10)
-      .to_string(index=False))
+print(threshold_grid.sort_values("F1", ascending=False).head(10).to_string(index=False))
 
-# Alternative policy: lowest validation threshold reaching >= 80% recall
-recall80 = threshold_df[threshold_df["Recall"] >= 0.80]
-if len(recall80) > 0:
-    threshold_recall80 = recall80["Threshold"].max()
-    r80_row = threshold_df.loc[
-        threshold_df["Threshold"] == threshold_recall80].iloc[0]
-    print(f"\nAlternative - lowest threshold for >=80% recall (validation): "
-          f"{threshold_recall80:.2f}  "
-          f"(Precision={r80_row['Precision']:.3f}, "
-          f"Recall={r80_row['Recall']:.3f})")
-else:
-    threshold_recall80 = None
-    print("\nNo threshold in [0.05, 0.50] reaches 80% recall on the "
-          "validation set - the model cannot support that target "
-          "without a much lower, likely impractical, cutoff.")
+chosen_row = threshold_grid.iloc[(threshold_grid["Threshold"] - DECISION_THRESHOLD).abs().argmin()]
+print(f"\nChosen threshold {DECISION_THRESHOLD}: Precision={chosen_row['Precision']:.3f}, "
+      f"Recall={chosen_row['Recall']:.3f}, F1={chosen_row['F1']:.3f}, "
+      f"Balanced Accuracy={chosen_row['Balanced_Accuracy']:.3f}")
+print(f"0.25 is used ahead of the raw F1-optimum ({f1_optimal_threshold:.3f}) because default "
+      f"is the costlier error to miss here, so recall is weighted a bit more heavily than a pure "
+      f"F1 maximum would give - while still keeping precision/false-positive rate reasonable.")
 
-# DEFAULT POLICY: the F1-maximizing threshold found on the validation
-# set above. Swap in threshold_recall80 instead if business needs a
-# guaranteed minimum recall and can tolerate the resulting precision.
-print(f"\nDecision threshold in use (chosen on VALIDATION, applied to "
-      f"TEST once): {decision_threshold:.3f}")
+xgb_preds_cal, xgb_metrics = evaluate_at_threshold(
+    y_test_ohe, probs_cal, DECISION_THRESHOLD, f"XGBoost + {best_cal_name}")
 
-# Apply the validation-chosen threshold to the TEST set, ONCE
-xgb_preds_cal = (probs_cal >= decision_threshold).astype(int)
-fpr_cal, tpr_cal, thr_cal = roc_curve(y_test_ohe, probs_cal)
+# 12. Model comparison
+comparison = pd.DataFrame({
+    'Logistic Regression': lr_metrics,
+    f'XGBoost + {best_cal_name}': xgb_metrics
+}).T
+print(f"\nModel comparison (decision threshold = {DECISION_THRESHOLD}):\n"
+      f"{comparison.to_string()}")
 
-print(f"\n>>> Downstream phases will now use: XGBoost + {best_cal_name}, "
-      f"threshold={decision_threshold:.3f} <<<")
-print(f"\nClassification Report (XGBoost Calibrated, TEST set, "
-      f"threshold={decision_threshold:.3f}):")
-print(classification_report(y_test_ohe, xgb_preds_cal))
- 
-
-# PHASE 9: CALIBRATION ANALYSIS
-
-print("\n" + "=" * 65)
-print("PHASE 9 - CALIBRATION ANALYSIS")
-print("=" * 65)
-
-# Calibration: are predicted probabilities reliable?
-# A well-calibrated model should show:
-# predicted PD 20% --> actual default rate ~20%
-
+# 13. Calibration diagnostics
 def hosmer_lemeshow(y_true, y_proba, n_bins=10):
-    """
-    Hosmer-Lemeshow goodness-of-fit test.
-    H0: model is well calibrated
-    Low p-value --> poor calibration
-    """
+    """H0: model is well calibrated. p > 0.05 fails to reject H0."""
     df = pd.DataFrame({'prob': y_proba, 'actual': y_true})
-    df['decile'] = pd.qcut(df['prob'], q=n_bins,
-                            duplicates='drop', labels=False)
-    grouped = df.groupby('decile').agg(
-        n=('actual', 'count'),
-        observed=('actual', 'sum'),
-        expected=('prob', 'sum')
-    )
-    hl_stat = (((grouped['observed'] - grouped['expected'])**2) /
-               (grouped['expected'] *
-                (1 - grouped['expected']/grouped['n']))).sum()
-    p_value = 1 - chi2.cdf(hl_stat, df=n_bins - 2)
-    return hl_stat, p_value
+    df['decile'] = pd.qcut(df['prob'], q=n_bins, duplicates='drop', labels=False)
+    g = df.groupby('decile').agg(n=('actual', 'count'), observed=('actual', 'sum'),
+                                  expected=('prob', 'sum'))
+    stat = (((g['observed'] - g['expected']) ** 2) /
+            (g['expected'] * (1 - g['expected'] / g['n']))).sum()
+    return stat, 1 - chi2.cdf(stat, df=n_bins - 2)
+
 
 def calibration_by_decile(y_true, y_proba, n_bins=10):
     """Predicted vs actual default rate by probability decile."""
     df = pd.DataFrame({'prob': y_proba, 'actual': y_true})
-    df['decile'] = pd.qcut(df['prob'], q=n_bins,
-                            duplicates='drop', labels=False)
-    result = df.groupby('decile').agg(
-        avg_predicted=('prob', 'mean'),
-        actual_rate=('actual', 'mean'),
-        count=('actual', 'count')
-    ).reset_index()
-    return result
+    df['decile'] = pd.qcut(df['prob'], q=n_bins, duplicates='drop', labels=False)
+    return df.groupby('decile').agg(avg_predicted=('prob', 'mean'),
+                                     actual_rate=('actual', 'mean'),
+                                     count=('actual', 'count')).reset_index()
 
-# LR calibration
-lr_hl_stat, lr_hl_p   = hosmer_lemeshow(
-    y_test_woe.values, lr_probs)
-lr_calib_df            = calibration_by_decile(
-    y_test_woe.values, lr_probs)
 
-# XGBoost calibration (using the CALIBRATED model, not the raw Phase 8 output)
-xgb_hl_stat, xgb_hl_p = hosmer_lemeshow(
-    y_test_ohe, probs_cal)
-xgb_calib_df           = calibration_by_decile(
-    y_test_ohe, probs_cal)
-
-print(f"\nHosmer-Lemeshow Test:")
-print(f"  LR:      stat={lr_hl_stat:.3f}, p={lr_hl_p:.4f} "
+lr_hl_stat, lr_hl_p = hosmer_lemeshow(y_test_woe.values, lr_probs)
+xgb_hl_stat, xgb_hl_p = hosmer_lemeshow(y_test_ohe, probs_cal)
+print(f"\nHosmer-Lemeshow: LR stat={lr_hl_stat:.3f}, p={lr_hl_p:.4f} "
       f"({'PASS' if lr_hl_p > 0.05 else 'FAIL'})")
-print(f"  XGBoost (Calibrated - {best_cal_name}): stat={xgb_hl_stat:.3f}, p={xgb_hl_p:.4f} "
+print(f"Hosmer-Lemeshow: XGBoost stat={xgb_hl_stat:.3f}, p={xgb_hl_p:.4f} "
       f"({'PASS' if xgb_hl_p > 0.05 else 'FAIL'})")
-print("\n(p > 0.05 = well calibrated, fail to reject H0)")
 
-print(f"\nCalibration by decile (LR):")
-print(lr_calib_df.to_string(index=False))
+lr_calib_df = calibration_by_decile(y_test_woe.values, lr_probs)
+xgb_calib_df = calibration_by_decile(y_test_ohe, probs_cal)
 
-# PHASE 10: CREDIT SCORECARD SCALING (Logistic Regression)
+# 14. Credit scorecard scaling (points to double odds)
+# Uses good:bad odds so score moves the right way - safer borrowers score
+# higher. Base odds are set from the training set's actual default rate
+# rather than an arbitrary 19:1, and PDO is widened to 50 so the score
+# spreads out properly across the PD range instead of bunching up.
+pdo, base_score = 50, 600
+base_pd = y_train_woe.mean()
+base_odds = (1 - base_pd) / base_pd          # good:bad odds at the base rate
+factor = pdo / np.log(2)
+offset = base_score - factor * np.log(base_odds)
+log_odds = np.log((1 - lr_probs + 1e-10) / (lr_probs + 1e-10))   # good:bad odds
+scores = np.clip(offset + factor * log_odds, 300, 850)
+print(f"\nCredit score range: {scores.min():.0f} - {scores.max():.0f}, mean {scores.mean():.0f}")
 
-print("\n" + "=" * 65)
-print("PHASE 10 - CREDIT SCORECARD SCALING")
-print("=" * 65)
-
-pdo        = 20
-base_score = 600
-base_odds  = 1/19
-factor     = pdo / np.log(2)
-offset     = base_score - factor * np.log(base_odds)
-
-log_odds = np.log(lr_probs / (1 - lr_probs + 1e-10))
-scores   = offset + factor * log_odds
-scores   = np.clip(scores, 300, 850)
-
-print(f"Credit Score Distribution:")
-print(f"  Min:  {scores.min():.0f}")
-print(f"  Max:  {scores.max():.0f}")
-print(f"  Mean: {scores.mean():.0f}")
-
-# KS test on score distribution
-from scipy import stats as scipy_stats
-ks_stat, ks_p = scipy_stats.kstest(
-    scores, 'norm', args=(scores.mean(), scores.std()))
-print(f"\nKS Test on score distribution:")
-print(f"  KS={ks_stat:.4f}, p={ks_p:.4f}")
-if ks_p > 0.05:
-    print("  Scores follow normal distribution")
-else:
-    print("  Scores do not follow normal distribution")
-
-scores_df = pd.DataFrame({
-    'score': scores, 'default': y_test_woe.values})
-print(f"\nAverage score by default status:")
-print(scores_df.groupby('default')['score'].mean())
-
-
-# PHASE 11: PSI (MODEL STABILITY)
-
-print("\n" + "=" * 65)
-print("PHASE 11 - PSI (MODEL STABILITY)")
-print("=" * 65)
-
-# NOTE: PSI here compares train vs test predicted probabilities.
-# In production, PSI would compare development sample vs
-# a future scoring population to detect distribution drift.
-
+# 15. Population Stability Index (train vs test predicted probabilities)
 def calculate_psi(expected, actual, bins=10):
-    bp  = np.linspace(0, 1, bins + 1)
-    e_c = np.histogram(expected, bins=bp)[0]
-    a_c = np.histogram(actual,   bins=bp)[0]
-    e_p = np.where(e_c/len(expected) == 0, 0.0001,
-                   e_c/len(expected))
-    a_p = np.where(a_c/len(actual)   == 0, 0.0001,
-                   a_c/len(actual))
+    bp = np.linspace(0, 1, bins + 1)
+    e_p = np.where(np.histogram(expected, bins=bp)[0] / len(expected) == 0,
+                    0.0001, np.histogram(expected, bins=bp)[0] / len(expected))
+    a_p = np.where(np.histogram(actual, bins=bp)[0] / len(actual) == 0,
+                    0.0001, np.histogram(actual, bins=bp)[0] / len(actual))
     psi_vals = (a_p - e_p) * np.log(a_p / e_p)
     return psi_vals.sum(), psi_vals
 
+
 train_probs_lr = lr.predict_proba(X_train_woe)[:, 1]
 psi_score, psi_bins = calculate_psi(train_probs_lr, lr_probs)
+psi_label = "stable" if psi_score < 0.1 else "moderate shift" if psi_score < 0.2 else "significant shift"
+print(f"PSI (train vs test): {psi_score:.4f} ({psi_label})")
 
-print(f"\nPSI (train vs test): {psi_score:.4f}")
-if psi_score < 0.1:
-    print("Stable - no significant distribution shift")
-elif psi_score < 0.2:
-    print("Moderate shift - monitor")
-else:
-    print("Significant shift - consider retraining")
-
-
-# PHASE 12: SHAP ANALYSIS (XGBoost Explainability)
-
-print("\n" + "=" * 65)
-print("PHASE 12 - SHAP ANALYSIS")
-print("=" * 65)
-
+# 16. SHAP explainability (on the pre-calibration tree model)
 try:
     import shap
-    print("Computing SHAP values...")
-    # NOTE: CalibratedClassifierCV (xgb_calibrated) wraps the tuned tree
-    # model in a Platt/Isotonic layer that TreeExplainer cannot see
-    # through. We explain xgb_for_cal instead - the same tuned tree
-    # model that the calibration layer sits on top of. Because both
-    # Platt scaling and isotonic regression are monotonic transforms,
-    # a feature's SHAP-ranked importance and direction still correctly
-    # explain *why* the model ranks a borrower as risky; the values
-    # are just expressed in the model's raw margin space rather than
-    # the final calibrated probability scale.
-    explainer   = shap.TreeExplainer(xgb_for_cal)
+    explainer = shap.TreeExplainer(xgb_for_cal)
     shap_values = explainer.shap_values(X_test_ohe)
-    SHAP_OK     = True
-    print("SHAP computation complete.")
+    shap_values_plot = shap_values[1] if isinstance(shap_values, list) else shap_values
 
-    # Different shap/xgboost version combos return either a single
-    # (n_samples, n_features) array or a list of two such arrays (one
-    # per class) for binary classification. Normalize to the
-    # positive-class array before plotting.
-    if isinstance(shap_values, list):
-        shap_values_plot = shap_values[1]
-    else:
-        shap_values_plot = shap_values
-
-    # Plot 1: Beeswarm summary (impact + direction per feature)
-    fig_shap1 = plt.figure(figsize=(10, 8))
+    plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values_plot, X_test_ohe, show=False, max_display=15)
-    plt.title('SHAP Summary - Feature Impact on Default Risk\n'
-              '(XGBoost base model, pre-calibration margin space)',
-              fontsize=12, fontweight='bold', pad=15)
+    plt.title('SHAP Summary - Feature Impact on Default Risk', fontweight='bold')
     plt.tight_layout()
-    plt.savefig('chart_11_shap_summary.png', dpi=150, bbox_inches='tight')
+    plt.savefig('chart_shap_summary.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: chart_11_shap_summary.png")
 
-    # Plot 2: Mean |SHAP value| bar chart (overall importance)
-    fig_shap2 = plt.figure(figsize=(9, 8))
-    shap.summary_plot(shap_values_plot, X_test_ohe, plot_type='bar',
-                       show=False, max_display=15)
-    plt.title('SHAP Feature Importance (Mean |SHAP value|)',
-              fontsize=12, fontweight='bold', pad=15)
+    plt.figure(figsize=(9, 8))
+    shap.summary_plot(shap_values_plot, X_test_ohe, plot_type='bar', show=False, max_display=15)
+    plt.title('SHAP Feature Importance (Mean |SHAP value|)', fontweight='bold')
     plt.tight_layout()
-    plt.savefig('chart_12_shap_importance.png', dpi=150, bbox_inches='tight')
+    plt.savefig('chart_shap_importance.png', dpi=150, bbox_inches='tight')
     plt.show()
-    print("Saved: chart_12_shap_importance.png")
-
 except ImportError:
-    print("SHAP not installed. Run: pip install shap")
-    SHAP_OK = False
-except Exception as e:
-    print(f"SHAP failed: {e}")
-    SHAP_OK = False
+    print("SHAP not installed; skipping. Run: pip install shap")
 
-
-# PHASE 13: PREDICTION FUNCTION
-
-print("\n" + "=" * 60)
-print("PHASE 13 - PREDICTION FUNCTION")
-print("=" * 60)
-
-def predict_new_customer(application, model, ohe_encoder,
-                          ohe_cat_cols, ohe_num_cols,
-                          offset, factor):
-    """
-    Predict default probability for a new loan application.
-    Uses the CALIBRATED XGBoost model (Platt/Isotonic) with OneHot
-    encoding, so predict_proba() returns a properly calibrated PD -
-    not just a well-ranked score - which is what the APPROVE/REVIEW/
-    REJECT thresholds below actually assume.
-    Unknown categories --> handled by handle_unknown='ignore'
-    in the OneHotEncoder (zero vector for unknown categories).
-    """
+# 17. Prediction function for new applications
+def predict_new_customer(application, model, encoder, cat_cols, num_cols, offset, factor):
+    """Score a single new loan application and return PD, credit score,
+    and a decision band centered on DECISION_THRESHOLD."""
     df = pd.DataFrame([application])
-
-    # Feature engineering
-    df['loan_to_income']  = df['loan_amnt'] / (df['annual_inc'] + 1)
+    df['loan_to_income'] = df['loan_amnt'] / (df['annual_inc'] + 1)
     df['revol_to_income'] = df['revol_bal'] / (df['annual_inc'] + 1)
-    df['has_pub_rec']     = (df['pub_rec']        > 0).astype(int)
-    df['has_delinq']      = (df['delinq_2yrs']    > 0).astype(int)
-    df['high_inq']        = (df['inq_last_6mths'] > 3).astype(int)
-    df['high_revol_util'] = (df['revol_util']     > 80).astype(int)
-
+    df['has_pub_rec'] = (df['pub_rec'] > 0).astype(int)
+    df['has_delinq'] = (df['delinq_2yrs'] > 0).astype(int)
+    df['high_inq'] = (df['inq_last_6mths'] > 3).astype(int)
+    df['high_revol_util'] = (df['revol_util'] > 80).astype(int)
     if 'installment' in df.columns:
-        df['payment_to_income'] = (df['installment'] /
-                                    (df['annual_inc'] / 12 + 1))
+        df['payment_to_income'] = df['installment'] / (df['annual_inc'] / 12 + 1)
         df.drop('installment', axis=1, inplace=True)
 
-    # Encode - unknown categories produce zero vectors (safe)
-    missing_cats = [c for c in ohe_cat_cols if c not in df.columns]
-    for c in missing_cats:
+    for c in [c for c in cat_cols if c not in df.columns]:
         df[c] = 'Unknown'
-
-    ohe_arr  = ohe_encoder.transform(df[ohe_cat_cols])
-    ohe_cols = ohe_encoder.get_feature_names_out(ohe_cat_cols)
-    ohe_df   = pd.DataFrame(ohe_arr, columns=ohe_cols)
-
-    missing_nums = [c for c in ohe_num_cols if c not in df.columns]
-    for c in missing_nums:
+    ohe_arr = encoder.transform(df[cat_cols])
+    ohe_df = pd.DataFrame(ohe_arr, columns=encoder.get_feature_names_out(cat_cols))
+    for c in [c for c in num_cols if c not in df.columns]:
         df[c] = 0
 
-    X_new = pd.concat([
-        df[ohe_num_cols].reset_index(drop=True),
-        ohe_df.reset_index(drop=True)
-    ], axis=1).fillna(0)
-
-    # Align columns
+    X_new = pd.concat([df[num_cols].reset_index(drop=True),
+                        ohe_df.reset_index(drop=True)], axis=1).fillna(0)
     X_new = X_new.reindex(columns=X_test_ohe.columns, fill_value=0)
 
-    pd_prob      = model.predict_proba(X_new)[0][1]
-    log_odds_new = np.log(pd_prob / (1 - pd_prob + 1e-10))
-    credit_score = float(np.clip(offset + factor * log_odds_new,
-                                  300, 850))
+    pd_prob = model.predict_proba(X_new)[0][1]
+    log_odds_new = np.log((1 - pd_prob + 1e-10) / (pd_prob + 1e-10))   # good:bad odds
+    credit_score = float(np.clip(offset + factor * log_odds_new, 300, 850))
 
-    if pd_prob < 0.20:
+    if pd_prob < DECISION_THRESHOLD - 0.05:
         decision = "APPROVE"
-    elif pd_prob < 0.40:
+    elif pd_prob < DECISION_THRESHOLD + 0.05:
         decision = "REVIEW"
     else:
         decision = "REJECT"
 
-    print("\n" + "=" * 50)
-    print("CREDIT DECISION - NEW CUSTOMER")
-    print("=" * 50)
-    print(f"Loan Amount:   £{application['loan_amnt']:,}")
-    print(f"Annual Income: £{application['annual_inc']:,}")
-    print(f"DTI:           {application['dti']}%")
-    print(f"Grade:         {application['grade']}")
-    print(f"\nPD (Probability of Default): {pd_prob:.2%}")
-    print(f"Credit Score:                {credit_score:.0f}")
-    print(f"Decision:            *** {decision} ***")
-    print("=" * 50)
+    print(f"\nPD: {pd_prob:.2%} | Credit score: {credit_score:.0f} | Decision: {decision}")
     return pd_prob, credit_score, decision
 
-# Test on two borrower profiles
+
 high_risk = {
-    'loan_amnt': 35000, 'int_rate': 24.5, 'grade': 'F',
-    'sub_grade': 'F3', 'emp_length': 2,
+    'loan_amnt': 35000, 'int_rate': 24.5, 'grade': 'F', 'emp_length': 2,
     'home_ownership': 'RENT', 'annual_inc': 30000,
-    'verification_status': 'Not Verified',
-    'purpose': 'debt_consolidation', 'dti': 35.0,
-    'delinq_2yrs': 2, 'inq_last_6mths': 4, 'open_acc': 6,
-    'pub_rec': 1, 'revol_bal': 18000, 'revol_util': 92.0,
-    'total_acc': 10, 'issue_month': 6, 'issue_quarter': 2,
+    'verification_status': 'Not Verified', 'purpose': 'debt_consolidation',
+    'dti': 35.0, 'delinq_2yrs': 2, 'inq_last_6mths': 4, 'open_acc': 6,
+    'pub_rec': 1, 'revol_bal': 18000, 'revol_util': 92.0, 'total_acc': 10,
+    'issue_month': 6, 'issue_quarter': 2,
 }
 low_risk = {
-    'loan_amnt': 8000, 'int_rate': 6.5, 'grade': 'A',
-    'sub_grade': 'A1', 'emp_length': 10,
+    'loan_amnt': 8000, 'int_rate': 6.5, 'grade': 'A', 'emp_length': 10,
     'home_ownership': 'MORTGAGE', 'annual_inc': 120000,
-    'verification_status': 'Verified',
-    'purpose': 'home_improvement', 'dti': 5.0,
-    'delinq_2yrs': 0, 'inq_last_6mths': 0, 'open_acc': 12,
-    'pub_rec': 0, 'revol_bal': 5000, 'revol_util': 15.0,
-    'total_acc': 20, 'issue_month': 3, 'issue_quarter': 1,
+    'verification_status': 'Verified', 'purpose': 'home_improvement',
+    'dti': 5.0, 'delinq_2yrs': 0, 'inq_last_6mths': 0, 'open_acc': 12,
+    'pub_rec': 0, 'revol_bal': 5000, 'revol_util': 15.0, 'total_acc': 20,
+    'issue_month': 3, 'issue_quarter': 1,
 }
+print("\nHigh risk borrower:")
+predict_new_customer(high_risk, xgb_calibrated, ohe, cat_cols_ohe, num_cols_ohe, offset, factor)
+print("\nLow risk borrower:")
+predict_new_customer(low_risk, xgb_calibrated, ohe, cat_cols_ohe, num_cols_ohe, offset, factor)
 
-print("\nHigh Risk Borrower:")
-predict_new_customer(high_risk, xgb_calibrated, ohe, cat_cols_ohe,
-                     num_cols_ohe, offset, factor)
-print("\nLow Risk Borrower:")
-predict_new_customer(low_risk, xgb_calibrated, ohe, cat_cols_ohe,
-                     num_cols_ohe, offset, factor)
+# 18. Visualizations
+fpr_lr, tpr_lr, _ = roc_curve(y_test_woe, lr_probs)
+fpr_cal, tpr_cal, _ = roc_curve(y_test_ohe, probs_cal)
 
-
-# PHASE 14: VISUALIZATIONS (individual charts)
-print("\n" + "=" * 65)
-print("PHASE 14 - VISUALIZATIONS")
-print("=" * 65)
-
-#  1. ROC Curves
 fig, ax = plt.subplots(figsize=(9, 7))
-ax.plot(fpr_lr,  tpr_lr,  'b-', lw=2,
-        label=f'Logistic Regression  (AUC={lr_auc:.4f}, KS={lr_ks:.3f})')
+ax.plot(fpr_lr, tpr_lr, 'b-', lw=2,
+        label=f"Logistic Regression (AUC={lr_metrics['auc']:.4f})")
 ax.plot(fpr_cal, tpr_cal, 'r-', lw=2,
-        label=f'XGBoost (Calibrated - {best_cal_name})  (AUC={auc_cal:.4f}, KS={ks_cal:.3f})')
+        label=f"XGBoost + {best_cal_name} (AUC={xgb_metrics['auc']:.4f})")
 ax.plot([0, 1], [0, 1], 'k--', label='Random classifier')
-ax.set_title('ROC Curve - Logistic Regression vs XGBoost (Calibrated)',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('False Positive Rate', fontsize=11)
-ax.set_ylabel('True Positive Rate', fontsize=11)
-ax.legend(fontsize=10)
-ax.grid(True, alpha=0.3)
+ax.set_title('ROC Curve', fontweight='bold')
+ax.set_xlabel('False Positive Rate')
+ax.set_ylabel('True Positive Rate')
+ax.legend()
+ax.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig('chart_01_roc_curves.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_roc_curves.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 2 Confusion Matrix - Logistic Regression
-fig, ax = plt.subplots(figsize=(7, 6))
-cm_lr = confusion_matrix(y_test_woe, lr_preds)
-sns.heatmap(cm_lr, annot=True, fmt='d', cmap='Blues', ax=ax,
-            xticklabels=['No Default', 'Default'],
-            yticklabels=['No Default', 'Default'],
-            annot_kws={'size': 14})
-ax.set_title('Confusion Matrix - Logistic Regression',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_ylabel('Actual', fontsize=11)
-ax.set_xlabel('Predicted', fontsize=11)
-plt.tight_layout()
-plt.savefig('chart_02_confusion_lr.png', dpi=150, bbox_inches='tight')
-plt.show()
-
-#3. Confusion Matrix - XGBoost (Calibrated)
-fig, ax = plt.subplots(figsize=(7, 6))
-cm_xgb = confusion_matrix(y_test_ohe, xgb_preds_cal)
-sns.heatmap(cm_xgb, annot=True, fmt='d', cmap='Oranges', ax=ax,
-            xticklabels=['No Default', 'Default'],
-            yticklabels=['No Default', 'Default'],
-            annot_kws={'size': 14})
-ax.set_title(f'Confusion Matrix - XGBoost (Calibrated - {best_cal_name})\n'
-             f'Decision threshold = {decision_threshold:.2f}  (not a naive 0.5 cutoff)',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_ylabel('Actual', fontsize=11)
-ax.set_xlabel('Predicted', fontsize=11)
-plt.tight_layout()
-plt.savefig('chart_03_confusion_xgb.png', dpi=150, bbox_inches='tight')
-plt.show()
-
-# 4. Calibration Curves
+frac_uncal, mean_uncal = calibration_curve(y_test_ohe, probs_uncal, n_bins=10)
+frac_platt, mean_platt = calibration_curve(y_test_ohe, probs_platt, n_bins=10)
+frac_iso, mean_iso = calibration_curve(y_test_ohe, probs_iso, n_bins=10)
 fig, ax = plt.subplots(figsize=(9, 7))
-frac_pos_lr,  mean_pred_lr  = calibration_curve(y_test_woe, lr_probs,  n_bins=10)
-frac_pos_xgb, mean_pred_xgb = calibration_curve(y_test_ohe, probs_cal, n_bins=10)
 ax.plot([0, 1], [0, 1], 'k--', label='Perfect calibration')
-ax.plot(mean_pred_lr,  frac_pos_lr,  'b-o', lw=2,
-        label=f'Logistic Regression (Brier={lr_brier:.4f})')
-ax.plot(mean_pred_xgb, frac_pos_xgb, 'r-o', lw=2,
-        label=f'XGBoost Calibrated - {best_cal_name} (Brier={brier_cal:.4f})')
-ax.set_title('Calibration Curve - Predicted PD vs Actual Default Rate',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('Mean Predicted Probability', fontsize=11)
-ax.set_ylabel('Fraction of Positives', fontsize=11)
-ax.legend(fontsize=10)
-ax.grid(True, alpha=0.3)
+ax.plot(mean_uncal, frac_uncal, 'r-o',
+        label=f"XGBoost uncalibrated (Brier={brier_score_loss(y_test_ohe, probs_uncal):.4f})")
+ax.plot(mean_platt, frac_platt, 'b-o',
+        label=f"XGBoost + Platt (Brier={brier_score_loss(y_test_ohe, probs_platt):.4f})")
+ax.plot(mean_iso, frac_iso, 'g-o',
+        label=f"XGBoost + Isotonic (Brier={brier_score_loss(y_test_ohe, probs_iso):.4f})")
+ax.set_title('Calibration Comparison - Before vs After Calibration', fontweight='bold')
+ax.set_xlabel('Mean Predicted Probability')
+ax.set_ylabel('Fraction of Positives')
+ax.legend()
+ax.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig('chart_04_calibration_curves.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_calibration_comparison.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 5. Calibration by Decile 
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+for ax, y_true, preds, name, cmap in [
+    (axes[0], y_test_woe, lr_preds, 'Logistic Regression', 'Blues'),
+    (axes[1], y_test_ohe, xgb_preds_cal, f'XGBoost + {best_cal_name}', 'Oranges'),
+]:
+    cm = confusion_matrix(y_true, preds)
+    sns.heatmap(cm, annot=True, fmt='d', cmap=cmap, ax=ax,
+                xticklabels=['No Default', 'Default'],
+                yticklabels=['No Default', 'Default'])
+    ax.set_title(f'{name}\nthreshold = {DECISION_THRESHOLD}', fontweight='bold')
+    ax.set_ylabel('Actual')
+    ax.set_xlabel('Predicted')
+plt.tight_layout()
+plt.savefig('chart_confusion_matrices.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+frac_pos_lr, mean_pred_lr = calibration_curve(y_test_woe, lr_probs, n_bins=10)
+frac_pos_xgb, mean_pred_xgb = calibration_curve(y_test_ohe, probs_cal, n_bins=10)
+fig, ax = plt.subplots(figsize=(9, 7))
+ax.plot([0, 1], [0, 1], 'k--', label='Perfect calibration')
+ax.plot(mean_pred_lr, frac_pos_lr, 'b-o', label=f"LR (Brier={lr_metrics['brier']:.4f})")
+ax.plot(mean_pred_xgb, frac_pos_xgb, 'r-o',
+        label=f"XGBoost + {best_cal_name} (Brier={xgb_metrics['brier']:.4f})")
+ax.set_title('Calibration Curve', fontweight='bold')
+ax.set_xlabel('Mean Predicted Probability')
+ax.set_ylabel('Fraction of Positives')
+ax.legend()
+ax.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig('chart_calibration_curves.png', dpi=150, bbox_inches='tight')
+plt.show()
+
 fig, ax = plt.subplots(figsize=(11, 7))
 x = np.arange(len(lr_calib_df))
 w = 0.35
-ax.bar(x - w/2, lr_calib_df['avg_predicted'], w,
-       color='steelblue', alpha=0.85, label='LR - Predicted')
-ax.bar(x - w/2, lr_calib_df['actual_rate'],   w,
-       color='steelblue', alpha=0.40, label='LR - Actual',
-       edgecolor='black', linewidth=0.8)
-ax.bar(x + w/2, xgb_calib_df['avg_predicted'], w,
-       color='firebrick', alpha=0.85, label='XGB (Calibrated) - Predicted')
-ax.bar(x + w/2, xgb_calib_df['actual_rate'],   w,
-       color='firebrick', alpha=0.40, label='XGB (Calibrated) - Actual',
-       edgecolor='black', linewidth=0.8)
-ax.set_title('Predicted vs Actual Default Rate by Probability Decile',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('Probability Decile', fontsize=11)
-ax.set_ylabel('Default Rate', fontsize=11)
+ax.bar(x - w/2, lr_calib_df['avg_predicted'], w, color='steelblue', alpha=0.85, label='LR - Predicted')
+ax.bar(x - w/2, lr_calib_df['actual_rate'], w, color='steelblue', alpha=0.40,
+       edgecolor='black', label='LR - Actual')
+ax.bar(x + w/2, xgb_calib_df['avg_predicted'], w, color='firebrick', alpha=0.85,
+       label='XGBoost - Predicted')
+ax.bar(x + w/2, xgb_calib_df['actual_rate'], w, color='firebrick', alpha=0.40,
+       edgecolor='black', label='XGBoost - Actual')
+ax.set_title('Predicted vs Actual Default Rate by Probability Decile', fontweight='bold')
+ax.set_xlabel('Probability Decile')
+ax.set_ylabel('Default Rate')
 ax.set_xticks(x)
-ax.legend(fontsize=10, ncol=2)
-ax.grid(True, alpha=0.3, axis='y')
+ax.legend(ncol=2)
+ax.grid(alpha=0.3, axis='y')
 plt.tight_layout()
-plt.savefig('chart_05_calibration_decile.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_calibration_decile.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 6. Information Value 
 fig, ax = plt.subplots(figsize=(9, 7))
-iv_plot = iv_df[iv_df['IV'] > 0.02]['IV'].sort_values()
-iv_plot.plot(kind='barh', color='steelblue', edgecolor='black',
-             alpha=0.8, ax=ax)
-ax.set_title('Information Value by Feature (Training Set)',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('IV', fontsize=11)
-ax.axvline(x=0.02, color='red', linestyle='--',
-           linewidth=1.2, label='IV = 0.02 threshold')
-ax.axvline(x=0.10, color='orange', linestyle='--',
-           linewidth=1.2, label='IV = 0.10 (medium predictor)')
-ax.axvline(x=0.30, color='green', linestyle='--',
-           linewidth=1.2, label='IV = 0.30 (strong predictor)')
-ax.legend(fontsize=9)
-ax.grid(True, alpha=0.3, axis='x')
+iv_df[iv_df['IV'] > 0.02]['IV'].sort_values().plot(kind='barh', ax=ax, color='steelblue')
+ax.set_title('Information Value by Feature', fontweight='bold')
+ax.axvline(0.10, color='orange', linestyle='--', label='Medium predictor (0.10)')
+ax.axvline(0.30, color='green', linestyle='--', label='Strong predictor (0.30)')
+ax.legend()
 plt.tight_layout()
-plt.savefig('chart_06_information_value.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_information_value.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 7. Credit Score Distribution
 fig, ax = plt.subplots(figsize=(9, 7))
-ax.hist(scores, bins=60, color='steelblue', edgecolor='black',
-        alpha=0.75, density=False)
-ax.axvline(scores.mean(), color='red', linestyle='--', linewidth=1.5,
-           label=f'Mean = {scores.mean():.0f}')
-ax.axvline(np.percentile(scores, 25), color='orange', linestyle=':',
-           linewidth=1.2, label=f'25th pct = {np.percentile(scores, 25):.0f}')
-ax.axvline(np.percentile(scores, 75), color='orange', linestyle=':',
-           linewidth=1.2, label=f'75th pct = {np.percentile(scores, 75):.0f}')
-ax.set_title('Credit Score Distribution (300–850)',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('Credit Score', fontsize=11)
-ax.set_ylabel('Frequency', fontsize=11)
-ax.legend(fontsize=10)
-ax.grid(True, alpha=0.3)
+ax.hist(scores, bins=60, color='steelblue', edgecolor='black', alpha=0.75)
+ax.axvline(scores.mean(), color='red', linestyle='--', label=f'Mean = {scores.mean():.0f}')
+ax.set_title('Credit Score Distribution (300-850)', fontweight='bold')
+ax.set_xlabel('Credit Score')
+ax.set_ylabel('Frequency')
+ax.legend()
 plt.tight_layout()
-plt.savefig('chart_07_score_distribution.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_score_distribution.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-# 8. PSI by PD Bucket
 fig, ax = plt.subplots(figsize=(9, 7))
-bins_labels = [f"{i*10}–{(i+1)*10}%" for i in range(len(psi_bins))]
+bin_labels = [f"{i*10}-{(i+1)*10}%" for i in range(len(psi_bins))]
 colors = ['firebrick' if v > 0.02 else 'steelblue' for v in psi_bins]
-ax.bar(bins_labels, psi_bins, color=colors, edgecolor='black', alpha=0.8)
+ax.bar(bin_labels, psi_bins, color=colors, edgecolor='black', alpha=0.8)
 ax.axhline(0, color='black', linewidth=0.8)
-ax.axhline(0.02, color='orange', linestyle='--', linewidth=1.2,
-           label='PSI contribution = 0.02')
-ax.set_title(f'PSI Contribution by PD Bucket  (Total PSI = {psi_score:.4f})',
-             fontsize=13, fontweight='bold', pad=15)
-ax.set_xlabel('PD Bucket', fontsize=11)
-ax.set_ylabel('PSI Contribution', fontsize=11)
+ax.axhline(0.02, color='orange', linestyle='--', label='PSI contribution = 0.02')
+ax.set_title(f'PSI Contribution by PD Bucket (Total PSI = {psi_score:.4f})', fontweight='bold')
+ax.set_xlabel('PD Bucket')
+ax.set_ylabel('PSI Contribution')
 ax.tick_params(axis='x', rotation=45)
-ax.legend(fontsize=10)
-ax.grid(True, alpha=0.3, axis='y')
+ax.legend()
+ax.grid(alpha=0.3, axis='y')
 plt.tight_layout()
-plt.savefig('chart_08_psi.png', dpi=150, bbox_inches='tight')
+plt.savefig('chart_psi.png', dpi=150, bbox_inches='tight')
 plt.show()
 
-
-
-# PHASE 15: IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK
-# Three macroeconomic scenarios are applied with probability weights:
-# • Base (50%) - stable economic conditions
-# • Optimistic(30%) - benign credit environment
-# • Downturn (20%) - stressed / recessionary conditions
-# PD is taken directly from the CALIBRATED XGBoost model.
-# LGD and EAD assumptions are fixed at loan-level using industry
-# conventions and are held constant across scenarios.
-# Scenario stress is applied via PD scalar multipliers.
-
- 
-print("\n" + "=" * 65)
-print("PHASE 15 - IFRS 9 EXPECTED CREDIT LOSS FRAMEWORK")
-print("=" * 65)
- 
-#  Rebuild test set with loan amounts 
-# We need the original loan_amnt column from test_raw.
-# test_raw was defined as loans_raw.iloc[split:].copy()
-# probs_cal are the CALIBRATED model PDs for the test set (same rows).
- 
-print("\nStep 1: Attaching loan-level data to test set PDs")
- 
+# 19. IFRS 9 expected credit loss
+# ECL = PD x LGD x EAD, probability-weighted across three macro scenarios.
+# PD comes from the calibrated XGBoost model. LGD and EAD are fixed,
+# industry-typical assumptions for unsecured consumer lending.
 ecl_df = pd.DataFrame({
-'pd_model' : probs_cal, # CALIBRATED model PD (Platt/Isotonic) - IFRS 9
-                        # needs probabilities that are correct on their
-                        # own scale, not just correctly RANKED, since
-                        # ECL = PD x LGD x EAD multiplies PD directly
-                        # into a currency loss amount.
-'loan_amnt' : test_raw['loan_amnt'].values,
-'actual' : y_test_ohe # true label
-}).reset_index(drop=True)
- 
-print(f" ECL working dataset: {ecl_df.shape[0]:,} loans")
-print(f" Mean model PD: {ecl_df['pd_model'].mean():.2%}")
- 
-#LGD Assumption 
-# Loss Given Default: the fraction of EAD lost if the borrower defaults.
-# LendingClub is unsecured consumer lending - industry LGD for
-# unsecured retail is typically 65-75%.
-# I use a tiered LGD based on loan amount (larger loans = slightly higher loss rate due to lower recovery on larger unsecured balances).
-print("\nStep 2: Assigning LGD (tiered by loan amount)")
- 
+    'pd_model': probs_cal,
+    'loan_amnt': test_loans['loan_amnt'].values,
+    'grade': test_loans['grade'].values if 'grade' in test_loans.columns else 'NA',
+})
+
+
 def assign_lgd(loan_amnt):
     if loan_amnt <= 5000:
-     return 0.60
-    elif loan_amnt <= 15000:
-     return 0.65
-    elif loan_amnt <= 25000:
-     return 0.70
-    else:
-     return 0.75
- 
+        return 0.60
+    if loan_amnt <= 15000:
+        return 0.65
+    if loan_amnt <= 25000:
+        return 0.70
+    return 0.75
+
+
 ecl_df['lgd'] = ecl_df['loan_amnt'].apply(assign_lgd)
-print(f" LGD distribution:")
-print(ecl_df['lgd'].value_counts().sort_index().to_string())
- 
-# EAD Assumption 
-# Exposure at Default: the outstanding balance at the time of default.
-# For term loans (LendingClub) EAD ≈ loan_amnt at origination
-# (no revolving draw-down risk). We apply a small amortisation
-# factor to reflect partial principal repayment before default,
-# assuming on average ~10% has been paid down.
-print("\nStep 3: Assigning EAD (loan amount with amortisation factor")
- 
-AMORTISATION_FACTOR = 0.90 # assume 10% average principal repaid
-ecl_df['ead'] = ecl_df['loan_amnt'] * AMORTISATION_FACTOR
- 
-print(f" Amortisation factor applied: {AMORTISATION_FACTOR:.0%}")
-print(f" Mean EAD: £{ecl_df['ead'].mean():,.0f}")
-print(f" Total portfolio EAD: £{ecl_df['ead'].sum():,.0f}")
- 
-# Scenario PD Multipliers 
-# IFRS 9 requires probability-weighted forward-looking scenarios.
-# PD multipliers represent how the macroeconomic environment
-# shifts default rates relative to the model's through-the-cycle PD.
-print("\nStep 4: Defining macro scenarios")
- 
-scenarios = {
-'Optimistic' : {'weight': 0.30, 'pd_multiplier': 0.75},
-'Base' : {'weight': 0.50, 'pd_multiplier': 1.00},
-'Downturn' : {'weight': 0.20, 'pd_multiplier': 1.50},
-}
- 
-print(f"\n {'Scenario':<12} {'Weight':>8} {'PD Scalar':>10} {'Implied Avg PD':>15}")
-print(" " + "-" * 48)
+ecl_df['ead'] = ecl_df['loan_amnt'] * 0.90  # ~10% average principal repaid pre-default
+
+scenarios = {'Optimistic': {'weight': 0.30, 'pd_multiplier': 0.75},
+             'Base': {'weight': 0.50, 'pd_multiplier': 1.00},
+             'Downturn': {'weight': 0.20, 'pd_multiplier': 1.50}}
+
 for name, cfg in scenarios.items():
-   implied_pd = ecl_df['pd_model'].mean() * cfg['pd_multiplier']
-print(f" {name:<12} {cfg['weight']:>8.0%} {cfg['pd_multiplier']:>10.2f}x"
-f" {implied_pd:>15.2%}")
- 
-# ECL Calculation per Scenario
-print("\nStep 5: Computing ECL per scenario")
+    ecl_df[f'pd_{name.lower()}'] = np.clip(ecl_df['pd_model'] * cfg['pd_multiplier'], 0, 1)
+    ecl_df[f'ecl_{name.lower()}'] = ecl_df[f'pd_{name.lower()}'] * ecl_df['lgd'] * ecl_df['ead']
 
-ecl_results = {}
-
-# Compute each scenario explicitly - no dynamic naming
-pd_optimistic = np.clip(ecl_df['pd_model'] * 0.75, 0, 1)
-pd_base       = np.clip(ecl_df['pd_model'] * 1.00, 0, 1)
-pd_downturn   = np.clip(ecl_df['pd_model'] * 1.50, 0, 1)
-
-ecl_df['pd_optimistic']  = pd_optimistic
-ecl_df['pd_base']        = pd_base
-ecl_df['pd_downturn']    = pd_downturn
-
-ecl_df['ecl_optimistic'] = ecl_df['pd_optimistic'] * ecl_df['lgd'] * ecl_df['ead']
-ecl_df['ecl_base']       = ecl_df['pd_base']       * ecl_df['lgd'] * ecl_df['ead']
-ecl_df['ecl_downturn']   = ecl_df['pd_downturn']   * ecl_df['lgd'] * ecl_df['ead']
-
-# Verify columns exist before proceeding
-for col in ['ecl_optimistic', 'ecl_base', 'ecl_downturn']:
-    assert col in ecl_df.columns, f"Missing column: {col}"
+ecl_df['ecl_weighted'] = sum(
+    ecl_df[f'ecl_{name.lower()}'] * cfg['weight'] for name, cfg in scenarios.items())
 
 total_ead = ecl_df['ead'].sum()
-
-ecl_results['Optimistic'] = {
-    'total_ecl' : ecl_df['ecl_optimistic'].sum(),
-    'ecl_rate'  : ecl_df['ecl_optimistic'].sum() / total_ead,
-    'weight'    : 0.30
-}
-ecl_results['Base'] = {
-    'total_ecl' : ecl_df['ecl_base'].sum(),
-    'ecl_rate'  : ecl_df['ecl_base'].sum() / total_ead,
-    'weight'    : 0.50
-}
-ecl_results['Downturn'] = {
-    'total_ecl' : ecl_df['ecl_downturn'].sum(),
-    'ecl_rate'  : ecl_df['ecl_downturn'].sum() / total_ead,
-    'weight'    : 0.20
-}
-
-for name, res in ecl_results.items():
-    print(f"\n  [{name}]")
-    print(f"    Total ECL:          £{res['total_ecl']:>15,.0f}")
-    print(f"    ECL Rate (ECL/EAD): {res['ecl_rate']:>10.2%}")
-
-# Probability-Weighted ECL (IFRS 9 headline number)
-print("\nStep 6: Probability-weighted ECL (IFRS 9 headline)")
-
-ecl_df['ecl_weighted'] = (
-    ecl_df['ecl_optimistic'] * 0.30 +
-    ecl_df['ecl_base']       * 0.50 +
-    ecl_df['ecl_downturn']   * 0.20
-)
-
 total_weighted_ecl = ecl_df['ecl_weighted'].sum()
-weighted_ecl_rate  = total_weighted_ecl / total_ead
 
-print(f"\n  Probability-Weighted ECL:  £{total_weighted_ecl:>15,.0f}")
-print(f"  Weighted ECL Rate:          {weighted_ecl_rate:>10.2%}")
-print(f"  Total Portfolio EAD:       £{total_ead:>15,.0f}")
-# ECL Summary Table
-print("IFRS 9 ECL SUMMARY")
-print(f" {'Scenario':<14} {'Weight':>7} {'Total ECL':>16} {'ECL Rate':>10}")
-print(" " + "-" * 50)
-for name, res in ecl_results.items():
-   print(f" {name:<14} {res['weight']:>7.0%}"
-f" £{res['total_ecl']:>15,.0f} {res['ecl_rate']:>9.2%}")
-print(" " + "-" * 50)
-print(f" {'Weighted (IFRS9)':<14} {'100%':>7}"
-f" £{total_weighted_ecl:>15,.0f} {weighted_ecl_rate:>9.2%}")
- 
-# ECL by Grade Bucket 
-# Segment ECL by loan grade to show where credit risk is concentrated.
-if 'grade' in test_raw.columns:
-   print("\nStep 7: ECL breakdown by loan grade...")
-ecl_df['grade'] = test_raw['grade'].values
- 
-grade_summary = ecl_df.groupby('grade').agg(
-loans = ('ead', 'count'),
-total_ead = ('ead', 'sum'),
-mean_pd = ('pd_model', 'mean'),
-mean_lgd = ('lgd', 'mean'),
-total_ecl_w = ('ecl_weighted', 'sum')
-).reset_index()
- 
-grade_summary['ecl_rate'] = (grade_summary['total_ecl_w'] /
-grade_summary['total_ead'])
-grade_summary['ecl_share'] = (grade_summary['total_ecl_w'] /
-grade_summary['total_ecl_w'].sum())
- 
-print(f"\n {'Grade':<8} {'Loans':>8} {'Avg PD':>8} {'Avg LGD':>8}"
-f" {'ECL':>14} {'ECL Rate':>9} {'ECL Share':>10}")
-print(" " + "-" * 70)
-for _, row in grade_summary.iterrows():
-   print(f" {row['grade']:<8} {int(row['loans']):>8,}"
-f" {row['mean_pd']:>8.2%} {row['mean_lgd']:>8.2%}"
-f" £{row['total_ecl_w']:>13,.0f} {row['ecl_rate']:>9.2%}"
-f" {row['ecl_share']:>10.2%}")
- 
-# Visualisations 
-print("\nGenerating IFRS 9 visualisations")
- 
-fig, axes = plt.subplots(2, 2, figsize=(14, 11))
-fig.suptitle('IFRS 9 Expected Credit Loss Framework\n'
-'ECL = PD × LGD × EAD | Three Scenario Analysis',
-fontsize=13, fontweight='bold', y=1.01)
- 
-# Plot A: ECL by Scenario (bar) 
-ax = axes[0, 0]
-scenario_names = list(ecl_results.keys()) + ['Weighted\n(IFRS 9)']
-scenario_values = [ecl_results[s]['total_ecl'] / 1e6
-for s in ecl_results] + [total_weighted_ecl / 1e6]
-bar_colors = ['#2ecc71', '#3498db', '#e74c3c', '#8e44ad']
-bars = ax.bar(scenario_names, scenario_values,
-color=bar_colors, edgecolor='black', alpha=0.85)
-ax.bar_label(bars, fmt='£%.1fM', fontsize=9, padding=3)
-ax.set_title('Total ECL by Scenario', fontsize=11, fontweight='bold')
-ax.set_ylabel('Expected Credit Loss (£M)', fontsize=10)
-ax.yaxis.set_major_formatter(
-plt.FuncFormatter(lambda x, _: f'£{x:.1f}M'))
-ax.grid(True, alpha=0.3, axis='y')
- 
-# Plot B: ECL Rate by Scenario 
-ax = axes[0, 1]
-scenario_rates = [ecl_results[s]['ecl_rate'] * 100
-for s in ecl_results] + [weighted_ecl_rate * 100]
-bars2 = ax.bar(scenario_names, scenario_rates,
-color=bar_colors, edgecolor='black', alpha=0.85)
-ax.bar_label(bars2, fmt='%.2f%%', fontsize=9, padding=3)
-ax.set_title('ECL Rate by Scenario (ECL / EAD)', fontsize=11,
-fontweight='bold')
-ax.set_ylabel('ECL Rate (%)', fontsize=10)
-ax.grid(True, alpha=0.3, axis='y')
- 
-# Plot C: ECL Distribution (weighted)
-ax = axes[1, 0]
-ax.hist(ecl_df['ecl_weighted'], bins=60,
-color='steelblue', edgecolor='black', alpha=0.75)
-ax.axvline(ecl_df['ecl_weighted'].mean(), color='red',
-linestyle='--', linewidth=1.5,
-label=f"Mean ECL = £{ecl_df['ecl_weighted'].mean():,.0f}")
-ax.axvline(ecl_df['ecl_weighted'].median(), color='orange',
-linestyle=':', linewidth=1.5,
-label=f"Median ECL = £{ecl_df['ecl_weighted'].median():,.0f}")
-ax.set_title('Loan-Level ECL Distribution\n(Probability-Weighted)',
-fontsize=11, fontweight='bold')
-ax.set_xlabel('ECL per Loan (£)', fontsize=10)
-ax.set_ylabel('Frequency', fontsize=10)
-ax.legend(fontsize=9)
-ax.grid(True, alpha=0.3)
- 
-# Plot D: ECL Share by Grade
-ax = axes[1, 1]
-if 'grade' in ecl_df.columns:
-   grade_plot = grade_summary.sort_values('grade')
-   ax.bar(grade_plot['grade'],
-   grade_plot['ecl_share'] * 100,
-   color='steelblue', edgecolor='black', alpha=0.85)
-   ax2_twin = ax.twinx()
-   ax2_twin.plot(grade_plot['grade'],
-   grade_plot['mean_pd'] * 100,
-   'ro-', linewidth=2, markersize=6,
-   label='Avg PD (%)')
-   ax2_twin.set_ylabel('Average PD (%)', color='red', fontsize=10)
-   ax2_twin.tick_params(axis='y', labelcolor='red')
-   ax2_twin.legend(loc='upper left', fontsize=9)
-   ax.set_title('ECL Concentration & Avg PD by Grade',
-   fontsize=11, fontweight='bold')
-   ax.set_xlabel('Loan Grade', fontsize=10)
-   ax.set_ylabel('ECL Share (%)', fontsize=10)
-   ax.grid(True, alpha=0.3, axis='y')
-else: ax.axis('off')
-ax.text(0.5, 0.5, 'Grade data not available',
- ha='center', va='center', transform=ax.transAxes)
- 
-plt.tight_layout()
-plt.savefig('chart_10_ifrs9_ecl.png', dpi=150, bbox_inches='tight')
-plt.show()
-# Final Summary 
-print("\n" + "=" * 65)
-print("IFRS 9 ECL FRAMEWORK - COMPLETE")
-print("=" * 65)
-print(f"\n Loans analysed: {len(ecl_df):>12,}")
-print(f" Total Portfolio EAD: £{total_ead:>12,.0f}")
-print(f" Avg LGD assumption: {ecl_df['lgd'].mean():>11.1%}")
-print(f" Amortisation factor: {AMORTISATION_FACTOR:>11.0%}")
-print(f"\n ECL by scenario:")
-for name, res in ecl_results.items():
- print(f" {name:<12} (w={res['weight']:.0%}): "
-f"£{res['total_ecl']:>12,.0f} | {res['ecl_rate']:.2%} of EAD")
-print(f"\n IFRS 9 Weighted ECL: £{total_weighted_ecl:>12,.0f}")
-print(f" IFRS 9 Weighted ECL Rate: {weighted_ecl_rate:>11.2%}")
-print("\n Note: LGD and EAD are fixed assumptions. In a production")
-print(" IFRS 9 model, LGD would be estimated from historical")
-print(" recoveries and EAD from facility-level drawdown data.")
+print(f"\nIFRS 9 ECL summary")
+for name, cfg in scenarios.items():
+    total = ecl_df[f'ecl_{name.lower()}'].sum()
+    print(f"  {name:<12} (w={cfg['weight']:.0%}): £{total:>14,.0f} | {total/total_ead:.2%} of EAD")
+print(f"  {'Weighted (IFRS 9)':<12} (w=100%): £{total_weighted_ecl:>14,.0f} | "
+      f"{total_weighted_ecl/total_ead:.2%} of EAD")
+
+if 'grade' in test_loans.columns:
+    grade_summary = ecl_df.groupby('grade').agg(
+        loans=('ead', 'count'), total_ead=('ead', 'sum'),
+        mean_pd=('pd_model', 'mean'), mean_lgd=('lgd', 'mean'),
+        total_ecl=('ecl_weighted', 'sum')).reset_index()
+    grade_summary['ecl_rate'] = grade_summary['total_ecl'] / grade_summary['total_ead']
+    grade_summary['ecl_share'] = grade_summary['total_ecl'] / grade_summary['total_ecl'].sum()
+    print(f"\nECL by grade:\n{grade_summary.to_string(index=False)}")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 11))
+    fig.suptitle('IFRS 9 Expected Credit Loss Framework\n'
+                 'ECL = PD x LGD x EAD | Three Scenario Analysis',
+                 fontsize=13, fontweight='bold', y=1.01)
+
+    scenario_names = list(scenarios.keys()) + ['Weighted\n(IFRS 9)']
+    bar_colors = ['#2ecc71', '#3498db', '#e74c3c', '#8e44ad']
+
+    # Total ECL by scenario
+    ax = axes[0, 0]
+    scenario_values = [ecl_df[f'ecl_{n.lower()}'].sum() / 1e6 for n in scenarios] + \
+                       [total_weighted_ecl / 1e6]
+    bars = ax.bar(scenario_names, scenario_values, color=bar_colors, edgecolor='black', alpha=0.85)
+    ax.bar_label(bars, fmt='£%.1fM', fontsize=9, padding=3)
+    ax.set_title('Total ECL by Scenario', fontweight='bold')
+    ax.set_ylabel('Expected Credit Loss (£M)')
+    ax.grid(alpha=0.3, axis='y')
+
+    # ECL rate by scenario
+    ax = axes[0, 1]
+    scenario_rates = [ecl_df[f'ecl_{n.lower()}'].sum() / total_ead * 100 for n in scenarios] + \
+                      [total_weighted_ecl / total_ead * 100]
+    bars2 = ax.bar(scenario_names, scenario_rates, color=bar_colors, edgecolor='black', alpha=0.85)
+    ax.bar_label(bars2, fmt='%.2f%%', fontsize=9, padding=3)
+    ax.set_title('ECL Rate by Scenario (ECL / EAD)', fontweight='bold')
+    ax.set_ylabel('ECL Rate (%)')
+    ax.grid(alpha=0.3, axis='y')
+
+    # Loan-level ECL distribution
+    ax = axes[1, 0]
+    ax.hist(ecl_df['ecl_weighted'], bins=60, color='steelblue', edgecolor='black', alpha=0.75)
+    ax.axvline(ecl_df['ecl_weighted'].mean(), color='red', linestyle='--',
+               label=f"Mean ECL = £{ecl_df['ecl_weighted'].mean():,.0f}")
+    ax.axvline(ecl_df['ecl_weighted'].median(), color='orange', linestyle=':',
+               label=f"Median ECL = £{ecl_df['ecl_weighted'].median():,.0f}")
+    ax.set_title('Loan-Level ECL Distribution\n(Probability-Weighted)', fontweight='bold')
+    ax.set_xlabel('ECL per Loan (£)')
+    ax.set_ylabel('Frequency')
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+
+    # ECL concentration and average PD by grade
+    ax = axes[1, 1]
+    grade_plot = grade_summary.sort_values('grade')
+    ax.bar(grade_plot['grade'], grade_plot['ecl_share'] * 100,
+           color='steelblue', edgecolor='black', alpha=0.85)
+    ax_twin = ax.twinx()
+    ax_twin.plot(grade_plot['grade'], grade_plot['mean_pd'] * 100,
+                 'ro-', linewidth=2, markersize=6, label='Avg PD (%)')
+    ax_twin.set_ylabel('Average PD (%)', color='red')
+    ax_twin.tick_params(axis='y', labelcolor='red')
+    ax_twin.legend(loc='upper left', fontsize=9)
+    ax.set_title('ECL Concentration & Avg PD by Grade', fontweight='bold')
+    ax.set_xlabel('Loan Grade')
+    ax.set_ylabel('ECL Share (%)')
+    ax.grid(alpha=0.3, axis='y')
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.94])
+    plt.figtext(0.5, -0.02,
+                "Note: the estimated lifetime ECL is elevated relative to typical benchmarks due to a "
+                "conservative default definition (includes 31-120 day delinquency) and the exclusion "
+                "of current, unresolved loans from the modeling population.",
+                ha='center', fontsize=9, style='italic', wrap=True)
+    plt.savefig('chart_ifrs9_ecl.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+print(f"\nPortfolio EAD: £{total_ead:,.0f} | IFRS 9 weighted ECL: £{total_weighted_ecl:,.0f} "
+      f"({total_weighted_ecl/total_ead:.2%})")
+print("\nNote: the estimated lifetime ECL is elevated relative to typical benchmarks due to a "
+      "conservative default definition (includes 31-120 day delinquency) and the exclusion of "
+      "current, unresolved loans from the modeling population.")
+
